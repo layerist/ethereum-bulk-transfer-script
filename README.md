@@ -55,13 +55,3 @@ This script uses the `web3` library to transfer all ETH from multiple Ethereum w
 ## License
 
 This project is licensed under the MIT License.
-```
-
-### Important Notes
-
-1. **Security**: Ensure that the private keys are handled securely and never exposed to unauthorized parties.
-2. **Testing**: Test the script with small amounts before transferring large sums.
-3. **Dependencies**: Make sure all necessary Python packages (`web3`) are installed.
-4. **Error Handling**: The script includes basic error handling, but you may want to add more robust mechanisms depending on your needs.
-
-Feel free to customize the script and documentation further to suit your specific requirements.
