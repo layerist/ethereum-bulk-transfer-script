@@ -2,6 +2,7 @@ import threading
 import time
 import logging
 from web3 import Web3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -15,6 +16,7 @@ INFURA_URL = 'YOUR_INFURA_URL'
 RECIPIENT_ADDRESS = 'RECIPIENT_ETH_ADDRESS'
 GAS_PRICE_GWEI = 50  # Adjust as necessary
 GAS_LIMIT = 21000
+MAX_WORKERS = 10  # Max number of threads
 
 # Initialize web3
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
@@ -42,7 +44,9 @@ def send_eth_from_wallet(wallet_address, private_key):
     try:
         # Get the balance of the wallet
         balance = web3.eth.get_balance(wallet_address)
-        if balance <= web3.toWei(GAS_PRICE_GWEI, 'gwei') * GAS_LIMIT:
+        required_gas_fee = web3.toWei(GAS_PRICE_GWEI, 'gwei') * GAS_LIMIT
+
+        if balance <= required_gas_fee:
             logging.info(f'Insufficient balance in wallet: {wallet_address}')
             return
 
@@ -54,7 +58,7 @@ def send_eth_from_wallet(wallet_address, private_key):
         tx = {
             'nonce': nonce,
             'to': RECIPIENT_ADDRESS,
-            'value': balance - gas_price * GAS_LIMIT,
+            'value': balance - required_gas_fee,
             'gas': GAS_LIMIT,
             'gasPrice': gas_price
         }
@@ -70,15 +74,15 @@ def send_eth_from_wallet(wallet_address, private_key):
         logging.error(f'Error sending ETH from {wallet_address}: {str(e)}')
 
 def process_wallets(wallet_addresses):
-    """Process each wallet in a separate thread."""
-    threads = []
-    for wallet_address, private_key in wallet_addresses:
-        thread = threading.Thread(target=send_eth_from_wallet, args=(wallet_address, private_key))
-        threads.append(thread)
-        thread.start()
-
-    for thread in threads:
-        thread.join()
+    """Process each wallet using a thread pool."""
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_wallet = {executor.submit(send_eth_from_wallet, wallet, key): (wallet, key) for wallet, key in wallet_addresses}
+        for future in as_completed(future_to_wallet):
+            wallet, key = future_to_wallet[future]
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Error processing wallet {wallet}: {str(e)}")
 
 if __name__ == "__main__":
     try:
