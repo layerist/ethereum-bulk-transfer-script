@@ -15,7 +15,6 @@ logging.basicConfig(
 INFURA_URL = 'YOUR_INFURA_URL'
 RECIPIENT_ADDRESS = 'RECIPIENT_ETH_ADDRESS'
 GAS_PRICE_GWEI = 50  # Adjust as necessary
-GAS_LIMIT = 21000
 MAX_WORKERS = 10  # Max number of threads
 
 # Initialize web3
@@ -44,9 +43,9 @@ def load_wallet_addresses(file_path='wallets.txt'):
         raise
 
 
-def calculate_transaction_fee():
+def calculate_transaction_fee(gas_limit):
     """Calculate the transaction fee in Wei based on the set gas price and limit."""
-    return web3.toWei(GAS_PRICE_GWEI, 'gwei') * GAS_LIMIT
+    return web3.toWei(GAS_PRICE_GWEI, 'gwei') * gas_limit
 
 
 def send_eth_from_wallet(wallet_address, private_key):
@@ -57,7 +56,12 @@ def send_eth_from_wallet(wallet_address, private_key):
     try:
         # Fetch wallet balance and calculate transaction fee
         balance = web3.eth.get_balance(wallet_address)
-        transaction_fee = calculate_transaction_fee()
+        gas_price = web3.toWei(GAS_PRICE_GWEI, 'gwei')
+
+        # Estimate gas if not predefined (more dynamic approach)
+        estimated_gas = web3.eth.estimate_gas({'from': wallet_address, 'to': RECIPIENT_ADDRESS, 'value': balance})
+
+        transaction_fee = calculate_transaction_fee(estimated_gas)
 
         if balance <= transaction_fee:
             logging.info(f'Insufficient balance in wallet {wallet_address}. Balance: {web3.fromWei(balance, "ether")} ETH')
@@ -65,14 +69,13 @@ def send_eth_from_wallet(wallet_address, private_key):
 
         # Build and sign the transaction
         nonce = web3.eth.get_transaction_count(wallet_address)
-        gas_price = web3.toWei(GAS_PRICE_GWEI, 'gwei')
         value_to_send = balance - transaction_fee
 
         transaction = {
             'nonce': nonce,
             'to': RECIPIENT_ADDRESS,
             'value': value_to_send,
-            'gas': GAS_LIMIT,
+            'gas': estimated_gas,
             'gasPrice': gas_price
         }
 
@@ -80,7 +83,7 @@ def send_eth_from_wallet(wallet_address, private_key):
 
         # Send the transaction and log the result
         tx_hash = web3.eth.send_raw_transaction(signed_transaction.rawTransaction)
-        logging.info(f'Transaction sent from {wallet_address}. TX Hash: {web3.toHex(tx_hash)}')
+        logging.info(f'Transaction sent from {wallet_address}. Sent {web3.fromWei(value_to_send, "ether")} ETH. TX Hash: {web3.toHex(tx_hash)}')
 
     except ValueError as e:
         # Web3 errors, typically related to nonce or transaction specifics
