@@ -3,6 +3,7 @@ import time
 import logging
 from web3 import Web3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.exceptions import Timeout
 
 # Configure logging
 logging.basicConfig(
@@ -16,6 +17,7 @@ INFURA_URL = 'YOUR_INFURA_URL'
 RECIPIENT_ADDRESS = 'RECIPIENT_ETH_ADDRESS'
 GAS_PRICE_GWEI = 50  # Adjust as necessary
 MAX_WORKERS = 10  # Max number of threads
+RETRY_LIMIT = 3  # Retry limit for failed transactions
 
 # Initialize web3
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
@@ -24,7 +26,6 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.isConnected():
     logging.critical("Failed to connect to the Ethereum network")
     raise ConnectionError("Failed to connect to the Ethereum network")
-
 
 def load_wallet_addresses(file_path='wallets.txt'):
     """
@@ -42,32 +43,25 @@ def load_wallet_addresses(file_path='wallets.txt'):
         logging.error(f"Error reading wallet file: {str(e)}")
         raise
 
-
 def calculate_transaction_fee(gas_limit):
     """Calculate the transaction fee in Wei based on the set gas price and limit."""
     return web3.toWei(GAS_PRICE_GWEI, 'gwei') * gas_limit
 
-
-def send_eth_from_wallet(wallet_address, private_key):
+def send_eth_from_wallet(wallet_address, private_key, retries=0):
     """
     Send ETH from a wallet to the recipient address.
-    This function handles signing and sending the transaction.
+    Implements retry logic for failed transactions.
     """
     try:
-        # Fetch wallet balance and calculate transaction fee
         balance = web3.eth.get_balance(wallet_address)
         gas_price = web3.toWei(GAS_PRICE_GWEI, 'gwei')
-
-        # Estimate gas if not predefined (more dynamic approach)
         estimated_gas = web3.eth.estimate_gas({'from': wallet_address, 'to': RECIPIENT_ADDRESS, 'value': balance})
-
         transaction_fee = calculate_transaction_fee(estimated_gas)
 
         if balance <= transaction_fee:
             logging.info(f'Insufficient balance in wallet {wallet_address}. Balance: {web3.fromWei(balance, "ether")} ETH')
             return
 
-        # Build and sign the transaction
         nonce = web3.eth.get_transaction_count(wallet_address)
         value_to_send = balance - transaction_fee
 
@@ -80,18 +74,19 @@ def send_eth_from_wallet(wallet_address, private_key):
         }
 
         signed_transaction = web3.eth.account.sign_transaction(transaction, private_key)
-
-        # Send the transaction and log the result
         tx_hash = web3.eth.send_raw_transaction(signed_transaction.rawTransaction)
         logging.info(f'Transaction sent from {wallet_address}. Sent {web3.fromWei(value_to_send, "ether")} ETH. TX Hash: {web3.toHex(tx_hash)}')
 
+    except Timeout as e:
+        if retries < RETRY_LIMIT:
+            logging.warning(f"Timeout occurred for wallet {wallet_address}. Retrying... ({retries + 1}/{RETRY_LIMIT})")
+            send_eth_from_wallet(wallet_address, private_key, retries=retries + 1)
+        else:
+            logging.error(f"Failed to send ETH from {wallet_address} after {RETRY_LIMIT} retries. Error: {str(e)}")
     except ValueError as e:
-        # Web3 errors, typically related to nonce or transaction specifics
         logging.error(f'Web3 error while sending ETH from {wallet_address}: {str(e)}')
     except Exception as e:
-        # Catch any unexpected errors
         logging.error(f'Unexpected error while sending ETH from {wallet_address}: {str(e)}')
-
 
 def process_wallets(wallet_addresses):
     """
@@ -109,7 +104,6 @@ def process_wallets(wallet_addresses):
                 future.result()  # Raise exception if the transaction failed
             except Exception as e:
                 logging.error(f"Error processing wallet {wallet}: {str(e)}")
-
 
 if __name__ == "__main__":
     try:
