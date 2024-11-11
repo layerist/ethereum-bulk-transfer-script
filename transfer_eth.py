@@ -15,43 +15,34 @@ logging.basicConfig(
 # Constants and configuration
 INFURA_URL = 'YOUR_INFURA_URL'
 RECIPIENT_ADDRESS = 'RECIPIENT_ETH_ADDRESS'
-GAS_PRICE_GWEI = 50  # Adjust as necessary
-MAX_WORKERS = 10  # Max number of threads
-RETRY_LIMIT = 3  # Retry limit for failed transactions
+GAS_PRICE_GWEI = 50  # Set gas price in gwei
+MAX_WORKERS = 10  # Max number of concurrent threads
+RETRY_LIMIT = 3  # Max retries for failed transactions
 
-# Initialize web3
+# Initialize Web3
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
-
-# Ensure connection is successful
 if not web3.isConnected():
-    logging.critical("Failed to connect to the Ethereum network")
-    raise ConnectionError("Failed to connect to the Ethereum network")
+    logging.critical("Failed to connect to Ethereum network.")
+    raise ConnectionError("Unable to connect to the Ethereum network.")
 
 def load_wallet_addresses(file_path='wallets.txt'):
-    """
-    Load wallet addresses and private keys from a file.
-    Each line in the file should be formatted as: address,private_key
-    """
+    """Load wallet addresses and private keys from a file."""
     try:
         with open(file_path, 'r') as file:
-            wallets = file.read().strip().splitlines()
-        return [wallet.split(',') for wallet in wallets if ',' in wallet]
+            return [line.strip().split(',') for line in file if ',' in line]
     except FileNotFoundError:
-        logging.critical("Wallet file not found")
+        logging.critical("Wallet file not found.")
         raise
     except Exception as e:
-        logging.error(f"Error reading wallet file: {str(e)}")
+        logging.error(f"Error reading wallet file: {e}")
         raise
 
 def calculate_transaction_fee(gas_limit):
-    """Calculate the transaction fee in Wei based on the set gas price and limit."""
+    """Calculate the transaction fee in Wei."""
     return web3.toWei(GAS_PRICE_GWEI, 'gwei') * gas_limit
 
-def send_eth_from_wallet(wallet_address, private_key, retries=0):
-    """
-    Send ETH from a wallet to the recipient address.
-    Implements retry logic for failed transactions.
-    """
+def send_eth(wallet_address, private_key, retries=0):
+    """Send ETH from wallet with retry logic for handling timeouts."""
     try:
         balance = web3.eth.get_balance(wallet_address)
         gas_price = web3.toWei(GAS_PRICE_GWEI, 'gwei')
@@ -63,61 +54,53 @@ def send_eth_from_wallet(wallet_address, private_key, retries=0):
             return
 
         nonce = web3.eth.get_transaction_count(wallet_address)
-        value_to_send = balance - transaction_fee
-
         transaction = {
             'nonce': nonce,
             'to': RECIPIENT_ADDRESS,
-            'value': value_to_send,
+            'value': balance - transaction_fee,
             'gas': estimated_gas,
             'gasPrice': gas_price
         }
 
         signed_transaction = web3.eth.account.sign_transaction(transaction, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_transaction.rawTransaction)
-        logging.info(f'Transaction sent from {wallet_address}. Sent {web3.fromWei(value_to_send, "ether")} ETH. TX Hash: {web3.toHex(tx_hash)}')
+        logging.info(f'Sent {web3.fromWei(balance - transaction_fee, "ether")} ETH from {wallet_address}. TX Hash: {web3.toHex(tx_hash)}')
 
-    except Timeout as e:
+    except Timeout:
         if retries < RETRY_LIMIT:
-            logging.warning(f"Timeout occurred for wallet {wallet_address}. Retrying... ({retries + 1}/{RETRY_LIMIT})")
-            send_eth_from_wallet(wallet_address, private_key, retries=retries + 1)
+            logging.warning(f"Timeout for wallet {wallet_address}. Retry {retries + 1}/{RETRY_LIMIT}.")
+            send_eth(wallet_address, private_key, retries + 1)
         else:
-            logging.error(f"Failed to send ETH from {wallet_address} after {RETRY_LIMIT} retries. Error: {str(e)}")
+            logging.error(f"Failed to send ETH from {wallet_address} after {RETRY_LIMIT} retries.")
     except ValueError as e:
-        logging.error(f'Web3 error while sending ETH from {wallet_address}: {str(e)}')
+        logging.error(f'Web3 error with {wallet_address}: {e}')
     except Exception as e:
-        logging.error(f'Unexpected error while sending ETH from {wallet_address}: {str(e)}')
+        logging.error(f'Unexpected error with {wallet_address}: {e}')
 
 def process_wallets(wallet_addresses):
-    """
-    Process each wallet using a thread pool to send ETH concurrently.
-    """
+    """Process each wallet in parallel to send ETH concurrently."""
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_wallet = {
-            executor.submit(send_eth_from_wallet, wallet, key): (wallet, key)
-            for wallet, key in wallet_addresses
+            executor.submit(send_eth, wallet, key): (wallet, key) for wallet, key in wallet_addresses
         }
-
         for future in as_completed(future_to_wallet):
-            wallet, key = future_to_wallet[future]
+            wallet, _ = future_to_wallet[future]
             try:
-                future.result()  # Raise exception if the transaction failed
+                future.result()  # Trigger exception if transaction failed
             except Exception as e:
-                logging.error(f"Error processing wallet {wallet}: {str(e)}")
+                logging.error(f"Error processing wallet {wallet}: {e}")
 
 if __name__ == "__main__":
     try:
         start_time = time.time()
         wallet_addresses = load_wallet_addresses()
-
         if not wallet_addresses:
-            logging.critical("No wallets found to process.")
-            raise ValueError("No wallets loaded.")
+            logging.critical("No wallets to process.")
+            raise ValueError("Wallet list is empty.")
 
         process_wallets(wallet_addresses)
 
-        end_time = time.time()
-        logging.info(f"Transfer process completed in {end_time - start_time:.2f} seconds")
-
+        elapsed_time = time.time() - start_time
+        logging.info(f"Transfer process completed in {elapsed_time:.2f} seconds.")
     except Exception as e:
-        logging.critical(f"An error occurred during the transfer process: {str(e)}")
+        logging.critical(f"Error during the transfer process: {e}")
