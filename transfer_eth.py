@@ -26,10 +26,17 @@ if not web3.isConnected():
     raise ConnectionError("Unable to connect to the Ethereum network.")
 
 def load_wallet_addresses(file_path='wallets.txt'):
-    """Load wallet addresses and private keys from a file."""
+    """
+    Load wallet addresses and private keys from a file.
+    Expects lines in the format: wallet_address,private_key.
+    """
     try:
         with open(file_path, 'r') as file:
-            return [line.strip().split(',') for line in file if ',' in line]
+            wallets = [line.strip().split(',') for line in file if ',' in line]
+            if not wallets:
+                logging.critical("Wallet file is empty.")
+                raise ValueError("Wallet file contains no valid data.")
+            return wallets
     except FileNotFoundError:
         logging.critical("Wallet file not found.")
         raise
@@ -42,17 +49,23 @@ def calculate_transaction_fee(gas_limit):
     return web3.toWei(GAS_PRICE_GWEI, 'gwei') * gas_limit
 
 def send_eth(wallet_address, private_key, retries=0):
-    """Send ETH from wallet with retry logic for handling timeouts."""
+    """
+    Send ETH from a wallet, with retry logic for handling timeouts and errors.
+    Retries up to RETRY_LIMIT times on failure.
+    """
     try:
         balance = web3.eth.get_balance(wallet_address)
         gas_price = web3.toWei(GAS_PRICE_GWEI, 'gwei')
+
+        # Estimate gas for the transaction
         estimated_gas = web3.eth.estimate_gas({'from': wallet_address, 'to': RECIPIENT_ADDRESS, 'value': balance})
         transaction_fee = calculate_transaction_fee(estimated_gas)
 
         if balance <= transaction_fee:
-            logging.info(f'Insufficient balance in wallet {wallet_address}. Balance: {web3.fromWei(balance, "ether")} ETH')
+            logging.info(f"Insufficient balance in wallet {wallet_address}. Balance: {web3.fromWei(balance, 'ether')} ETH")
             return
 
+        # Prepare transaction
         nonce = web3.eth.get_transaction_count(wallet_address)
         transaction = {
             'nonce': nonce,
@@ -62,9 +75,10 @@ def send_eth(wallet_address, private_key, retries=0):
             'gasPrice': gas_price
         }
 
+        # Sign and send the transaction
         signed_transaction = web3.eth.account.sign_transaction(transaction, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_transaction.rawTransaction)
-        logging.info(f'Sent {web3.fromWei(balance - transaction_fee, "ether")} ETH from {wallet_address}. TX Hash: {web3.toHex(tx_hash)}')
+        logging.info(f"Sent {web3.fromWei(balance - transaction_fee, 'ether')} ETH from {wallet_address}. TX Hash: {web3.toHex(tx_hash)}")
 
     except Timeout:
         if retries < RETRY_LIMIT:
@@ -73,12 +87,15 @@ def send_eth(wallet_address, private_key, retries=0):
         else:
             logging.error(f"Failed to send ETH from {wallet_address} after {RETRY_LIMIT} retries.")
     except ValueError as e:
-        logging.error(f'Web3 error with {wallet_address}: {e}')
+        logging.error(f"Web3 error for wallet {wallet_address}: {e}")
     except Exception as e:
-        logging.error(f'Unexpected error with {wallet_address}: {e}')
+        logging.error(f"Unexpected error for wallet {wallet_address}: {e}")
 
 def process_wallets(wallet_addresses):
-    """Process each wallet in parallel to send ETH concurrently."""
+    """
+    Process each wallet in parallel, sending ETH concurrently.
+    Logs errors encountered for individual wallets.
+    """
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_wallet = {
             executor.submit(send_eth, wallet, key): (wallet, key) for wallet, key in wallet_addresses
@@ -86,7 +103,7 @@ def process_wallets(wallet_addresses):
         for future in as_completed(future_to_wallet):
             wallet, _ = future_to_wallet[future]
             try:
-                future.result()  # Trigger exception if transaction failed
+                future.result()  # Retrieve results or trigger exceptions
             except Exception as e:
                 logging.error(f"Error processing wallet {wallet}: {e}")
 
@@ -94,12 +111,7 @@ if __name__ == "__main__":
     try:
         start_time = time.time()
         wallet_addresses = load_wallet_addresses()
-        if not wallet_addresses:
-            logging.critical("No wallets to process.")
-            raise ValueError("Wallet list is empty.")
-
         process_wallets(wallet_addresses)
-
         elapsed_time = time.time() - start_time
         logging.info(f"Transfer process completed in {elapsed_time:.2f} seconds.")
     except Exception as e:
