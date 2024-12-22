@@ -15,17 +15,18 @@ logging.basicConfig(
 # Constants and configuration
 INFURA_URL = 'YOUR_INFURA_URL'
 RECIPIENT_ADDRESS = 'RECIPIENT_ETH_ADDRESS'
-GAS_PRICE_GWEI = 50  # Set gas price in gwei
+GAS_PRICE_GWEI = 50  # Set gas price in Gwei
 MAX_WORKERS = 10  # Max number of concurrent threads
 RETRY_LIMIT = 3  # Max retries for failed transactions
+WALLET_FILE = 'wallets.txt'  # Path to wallet file
 
 # Initialize Web3
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.isConnected():
-    logging.critical("Failed to connect to Ethereum network.")
+    logging.critical("Failed to connect to the Ethereum network.")
     raise ConnectionError("Unable to connect to the Ethereum network.")
 
-def load_wallet_addresses(file_path='wallets.txt'):
+def load_wallet_addresses(file_path=WALLET_FILE):
     """
     Load wallet addresses and private keys from a file.
     Expects lines in the format: wallet_address,private_key.
@@ -34,11 +35,11 @@ def load_wallet_addresses(file_path='wallets.txt'):
         with open(file_path, 'r') as file:
             wallets = [line.strip().split(',') for line in file if ',' in line]
             if not wallets:
-                logging.critical("Wallet file is empty.")
+                logging.critical("Wallet file is empty or incorrectly formatted.")
                 raise ValueError("Wallet file contains no valid data.")
             return wallets
     except FileNotFoundError:
-        logging.critical("Wallet file not found.")
+        logging.critical(f"Wallet file '{file_path}' not found.")
         raise
     except Exception as e:
         logging.error(f"Error reading wallet file: {e}")
@@ -46,7 +47,8 @@ def load_wallet_addresses(file_path='wallets.txt'):
 
 def calculate_transaction_fee(gas_limit):
     """Calculate the transaction fee in Wei."""
-    return web3.toWei(GAS_PRICE_GWEI, 'gwei') * gas_limit
+    gas_price = web3.toWei(GAS_PRICE_GWEI, 'gwei')
+    return gas_price * gas_limit
 
 def send_eth(wallet_address, private_key, retries=0):
     """
@@ -58,11 +60,16 @@ def send_eth(wallet_address, private_key, retries=0):
         gas_price = web3.toWei(GAS_PRICE_GWEI, 'gwei')
 
         # Estimate gas for the transaction
-        estimated_gas = web3.eth.estimate_gas({'from': wallet_address, 'to': RECIPIENT_ADDRESS, 'value': balance})
+        estimated_gas = web3.eth.estimate_gas({
+            'from': wallet_address,
+            'to': RECIPIENT_ADDRESS,
+            'value': balance
+        })
         transaction_fee = calculate_transaction_fee(estimated_gas)
 
         if balance <= transaction_fee:
-            logging.info(f"Insufficient balance in wallet {wallet_address}. Balance: {web3.fromWei(balance, 'ether')} ETH")
+            logging.info(f"Insufficient balance in wallet {wallet_address}. "
+                         f"Balance: {web3.fromWei(balance, 'ether')} ETH, Required: {web3.fromWei(transaction_fee, 'ether')} ETH")
             return
 
         # Prepare transaction
@@ -87,7 +94,7 @@ def send_eth(wallet_address, private_key, retries=0):
         else:
             logging.error(f"Failed to send ETH from {wallet_address} after {RETRY_LIMIT} retries.")
     except ValueError as e:
-        logging.error(f"Web3 error for wallet {wallet_address}: {e}")
+        logging.error(f"Transaction error for wallet {wallet_address}: {e}")
     except Exception as e:
         logging.error(f"Unexpected error for wallet {wallet_address}: {e}")
 
