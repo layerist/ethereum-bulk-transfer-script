@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 import logging
@@ -13,12 +14,12 @@ logging.basicConfig(
 )
 
 # Constants and configuration
-INFURA_URL = 'YOUR_INFURA_URL'
-RECIPIENT_ADDRESS = 'RECIPIENT_ETH_ADDRESS'
-GAS_PRICE_GWEI = 50  # Set gas price in Gwei
-MAX_WORKERS = 10  # Max number of concurrent threads
-RETRY_LIMIT = 3  # Max retries for failed transactions
-WALLET_FILE = 'wallets.txt'  # Path to wallet file
+INFURA_URL = os.getenv('INFURA_URL', 'YOUR_INFURA_URL')  # Use environment variable or placeholder
+RECIPIENT_ADDRESS = os.getenv('RECIPIENT_ADDRESS', 'RECIPIENT_ETH_ADDRESS')
+GAS_PRICE_GWEI = int(os.getenv('GAS_PRICE_GWEI', 50))  # Set gas price in Gwei
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', 10))  # Max number of concurrent threads
+RETRY_LIMIT = int(os.getenv('RETRY_LIMIT', 3))  # Max retries for failed transactions
+WALLET_FILE = os.getenv('WALLET_FILE', 'wallets.txt')  # Path to wallet file
 
 # Initialize Web3
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
@@ -74,10 +75,15 @@ def send_eth(wallet_address, private_key, retries=0):
 
         # Prepare transaction
         nonce = web3.eth.get_transaction_count(wallet_address)
+        value_to_send = balance - transaction_fee
+        if value_to_send <= 0:
+            logging.warning(f"Skipping wallet {wallet_address} due to insufficient balance after fee deduction.")
+            return
+
         transaction = {
             'nonce': nonce,
             'to': RECIPIENT_ADDRESS,
-            'value': balance - transaction_fee,
+            'value': value_to_send,
             'gas': estimated_gas,
             'gasPrice': gas_price
         }
@@ -85,7 +91,7 @@ def send_eth(wallet_address, private_key, retries=0):
         # Sign and send the transaction
         signed_transaction = web3.eth.account.sign_transaction(transaction, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_transaction.rawTransaction)
-        logging.info(f"Sent {web3.fromWei(balance - transaction_fee, 'ether')} ETH from {wallet_address}. TX Hash: {web3.toHex(tx_hash)}")
+        logging.info(f"Sent {web3.fromWei(value_to_send, 'ether')} ETH from {wallet_address}. TX Hash: {web3.toHex(tx_hash)}")
 
     except Timeout:
         if retries < RETRY_LIMIT:
