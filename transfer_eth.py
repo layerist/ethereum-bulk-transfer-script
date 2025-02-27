@@ -54,7 +54,7 @@ def send_eth(wallet_address, private_key, retries=0):
         estimated_gas = web3.eth.estimate_gas({
             'from': wallet_address,
             'to': RECIPIENT_ADDRESS,
-            'value': balance
+            'value': balance // 2  # Estimate gas with a reasonable value
         })
         transaction_fee = calculate_transaction_fee(estimated_gas)
 
@@ -75,7 +75,8 @@ def send_eth(wallet_address, private_key, retries=0):
             'to': RECIPIENT_ADDRESS,
             'value': value_to_send,
             'gas': estimated_gas,
-            'gasPrice': gas_price
+            'gasPrice': gas_price,
+            'chainId': web3.eth.chain_id
         }
 
         signed_tx = web3.eth.account.sign_transaction(tx, private_key)
@@ -85,6 +86,7 @@ def send_eth(wallet_address, private_key, retries=0):
     except Timeout:
         if retries < RETRY_LIMIT:
             logging.warning(f"Timeout for {wallet_address}. Retrying {retries + 1}/{RETRY_LIMIT}.")
+            time.sleep(2 ** retries)  # Exponential backoff
             return send_eth(wallet_address, private_key, retries + 1)
         logging.error(f"Failed to send ETH from {wallet_address} after {RETRY_LIMIT} retries.")
     except ValueError as e:
