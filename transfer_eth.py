@@ -4,6 +4,7 @@ import logging
 from web3 import Web3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.exceptions import Timeout
+from typing import List, Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -26,11 +27,11 @@ if not web3.isConnected():
     logging.critical("Failed to connect to the Ethereum network.")
     raise ConnectionError("Unable to connect to the Ethereum network.")
 
-def load_wallets(file_path=WALLET_FILE):
+def load_wallets(file_path: str = WALLET_FILE) -> List[Tuple[str, str]]:
     """Load wallet addresses and private keys from a file."""
     try:
         with open(file_path, 'r') as file:
-            wallets = [line.strip().split(',') for line in file if ',' in line]
+            wallets = [tuple(line.strip().split(',')) for line in file if ',' in line]
         if not wallets:
             raise ValueError("Wallet file contains no valid data.")
         return wallets
@@ -41,20 +42,19 @@ def load_wallets(file_path=WALLET_FILE):
         logging.error(f"Error reading wallet file: {e}")
         raise
 
-def calculate_transaction_fee(gas_limit):
+def calculate_transaction_fee(gas_limit: int) -> int:
     """Calculate the transaction fee in Wei using dynamic gas price."""
-    gas_price = web3.eth.gas_price
-    return gas_price * gas_limit
+    return web3.eth.gas_price * gas_limit
 
-def send_eth(wallet_address, private_key, retries=0):
+def send_eth(wallet_address: str, private_key: str, retries: int = 0) -> None:
     """Send ETH from a wallet with retry logic."""
     try:
         balance = web3.eth.get_balance(wallet_address)
-        gas_price = web3.eth.gas_price  # Use current gas price
+        gas_price = web3.eth.gas_price
         estimated_gas = web3.eth.estimate_gas({
             'from': wallet_address,
             'to': RECIPIENT_ADDRESS,
-            'value': balance // 2  # Estimate gas with a reasonable value
+            'value': balance // 2
         })
         transaction_fee = calculate_transaction_fee(estimated_gas)
 
@@ -86,7 +86,7 @@ def send_eth(wallet_address, private_key, retries=0):
     except Timeout:
         if retries < RETRY_LIMIT:
             logging.warning(f"Timeout for {wallet_address}. Retrying {retries + 1}/{RETRY_LIMIT}.")
-            time.sleep(2 ** retries)  # Exponential backoff
+            time.sleep(2 ** retries)
             return send_eth(wallet_address, private_key, retries + 1)
         logging.error(f"Failed to send ETH from {wallet_address} after {RETRY_LIMIT} retries.")
     except ValueError as e:
@@ -94,7 +94,7 @@ def send_eth(wallet_address, private_key, retries=0):
     except Exception as e:
         logging.error(f"Unexpected error for {wallet_address}: {e}")
 
-def process_wallets(wallets):
+def process_wallets(wallets: List[Tuple[str, str]]) -> None:
     """Process wallets in parallel using ThreadPoolExecutor."""
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_wallet = {executor.submit(send_eth, w, k): (w, k) for w, k in wallets}
