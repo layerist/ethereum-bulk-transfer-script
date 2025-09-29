@@ -14,11 +14,10 @@ from web3.types import Wei, TxReceipt
 LOG_FILE = "transfer_log.txt"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
 )
-
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("eth-transfer")
 
 # ---------------------- Configuration ----------------------
 def bool_from_env(name: str, default: bool = False) -> bool:
@@ -27,7 +26,6 @@ def bool_from_env(name: str, default: bool = False) -> bool:
     if val is None:
         return default
     return str(val).strip().lower() in {"1", "true", "yes", "on"}
-
 
 INFURA_URL: str = os.getenv("INFURA_URL", "")
 RECIPIENT_ADDRESS: str = os.getenv("RECIPIENT_ADDRESS", "")
@@ -39,9 +37,10 @@ WALLET_FILE: str = os.getenv("WALLET_FILE", "wallets.txt")
 GAS_BUFFER_MULTIPLIER: float = float(os.getenv("GAS_BUFFER_MULTIPLIER", "1.1"))
 WAIT_FOR_RECEIPT: bool = bool_from_env("WAIT_FOR_RECEIPT", False)
 RECEIPT_TIMEOUT: int = int(os.getenv("RECEIPT_TIMEOUT", "120"))
+PRIORITY_FEE_GWEI: int = int(os.getenv("PRIORITY_FEE_GWEI", "2"))
 
 if not INFURA_URL or not RECIPIENT_ADDRESS:
-    raise EnvironmentError("Missing required environment variables: INFURA_URL or RECIPIENT_ADDRESS")
+    raise EnvironmentError("Missing required env vars: INFURA_URL or RECIPIENT_ADDRESS")
 
 # ---------------------- Web3 Initialization ----------------------
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
@@ -53,7 +52,6 @@ if not web3.is_connected():
 def eth_fmt(wei: int) -> str:
     """Format Wei as ETH string."""
     return f"{web3.from_wei(wei, 'ether'):.6f} ETH"
-
 
 def load_wallets(file_path: str) -> List[Tuple[str, str]]:
     """Load wallets from a file: 'address,private_key'."""
@@ -74,7 +72,6 @@ def load_wallets(file_path: str) -> List[Tuple[str, str]]:
         logger.critical(f"Error loading wallets: {e}")
         raise
 
-
 def get_gas_price() -> Wei:
     """Return gas price in Wei (legacy)."""
     return (
@@ -83,15 +80,13 @@ def get_gas_price() -> Wei:
         else web3.eth.gas_price
     )
 
-
 def get_eip1559_fees() -> Dict[str, Wei]:
-    """Get EIP-1559 fees (baseFee, priorityFee)."""
+    """Get EIP-1559 fee parameters."""
     history = web3.eth.fee_history(1, "latest")
     base_fee = history["baseFeePerGas"][-1]
-    priority_fee = web3.to_wei(2, "gwei")  # configurable
+    priority_fee = web3.to_wei(PRIORITY_FEE_GWEI, "gwei")
     max_fee = int(base_fee * 2 + priority_fee)
     return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority_fee}
-
 
 def estimate_fee(sender_address: str) -> Tuple[int, Wei]:
     """Estimate gas limit and total fee with buffer."""
@@ -101,17 +96,17 @@ def estimate_fee(sender_address: str) -> Tuple[int, Wei]:
     gas_price = get_gas_price()
     return gas_limit, gas_limit * gas_price
 
-
 def retry_with_backoff(fn: Callable[..., Any], retries: int, *args, **kwargs) -> Any:
-    """Retry a function with exponential backoff (2^n seconds)."""
+    """Retry a function with exponential backoff (up to 30s)."""
     for attempt in range(retries + 1):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             if attempt < retries:
-                wait_time = min(2**attempt, 30)  # cap at 30s
+                wait_time = min(2**attempt, 30)
                 logger.warning(
-                    f"{fn.__name__} failed (attempt {attempt+1}/{retries}): {e}. Retrying in {wait_time}s..."
+                    f"{fn.__name__} failed (attempt {attempt+1}/{retries}): {e}. "
+                    f"Retrying in {wait_time}s..."
                 )
                 time.sleep(wait_time)
             else:
@@ -138,7 +133,7 @@ def send_eth(wallet_address: str, private_key: str, index: int) -> None:
         value = balance - estimated_fee
         nonce = retry_with_backoff(web3.eth.get_transaction_count, RETRY_LIMIT, wallet_address)
 
-        tx = {
+        tx: Dict[str, Any] = {
             "nonce": nonce,
             "to": RECIPIENT_ADDRESS,
             "value": value,
@@ -165,7 +160,7 @@ def send_eth(wallet_address: str, private_key: str, index: int) -> None:
                 status = "Success" if receipt["status"] == 1 else "Failed"
                 logger.info(f"[{index}] TX {tx_hex} confirmed. Status: {status}")
             except Exception as e:
-                logger.error(f"[{index}] Failed waiting for TX {tx_hex} receipt: {e}")
+                logger.error(f"[{index}] Timeout/error waiting for TX {tx_hex} receipt: {e}")
 
     except (ValueError, Timeout) as e:
         logger.error(f"[{index}] RPC/Timeout error for {wallet_address}: {e}")
@@ -176,12 +171,12 @@ def send_eth(wallet_address: str, private_key: str, index: int) -> None:
 def process_wallets(wallets: List[Tuple[str, str]]) -> None:
     """Send ETH from all wallets concurrently."""
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_wallet = {
+        futures = {
             executor.submit(send_eth, addr, key, i): (addr, i)
             for i, (addr, key) in enumerate(wallets)
         }
-        for future in as_completed(future_to_wallet):
-            addr, i = future_to_wallet[future]
+        for future in as_completed(futures):
+            addr, i = futures[future]
             try:
                 future.result()
             except Exception as e:
@@ -192,20 +187,20 @@ def handle_interrupt(sig, frame):
     logger.warning("Script interrupted. Exiting gracefully...")
     raise SystemExit(0)
 
-
 signal.signal(signal.SIGINT, handle_interrupt)
 
 # ---------------------- Main ----------------------
-def main():
+def main() -> None:
     try:
         start = time.time()
         wallets = load_wallets(WALLET_FILE)
+        logger.info(f"Loaded {len(wallets)} wallets. Starting transfers...")
         process_wallets(wallets)
         elapsed = time.time() - start
         logger.info(f"All transfers completed in {elapsed:.2f} seconds.")
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
-
+        raise
 
 if __name__ == "__main__":
     main()
