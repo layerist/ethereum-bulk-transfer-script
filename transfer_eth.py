@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import signal
+import threading
 from typing import List, Tuple, Callable, Any, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -15,13 +16,14 @@ from web3.exceptions import TransactionNotFound
 LOG_FILE = "transfer_log.txt"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     handlers=[
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler()
+        logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger("eth-transfer")
+log_lock = threading.Lock()
 
 # ============================================================
 #                      CONFIGURATION
@@ -33,14 +35,16 @@ def bool_from_env(name: str, default: bool = False) -> bool:
 INFURA_URL              = os.getenv("INFURA_URL", "")
 RECIPIENT_ADDRESS       = os.getenv("RECIPIENT_ADDRESS", "")
 GAS_PRICE_GWEI          = int(os.getenv("GAS_PRICE_GWEI", "0"))
-USE_EIP1559             = bool_from_env("USE_EIP1559", False)
+USE_EIP1559             = bool_from_env("USE_EIP1559", True)
 MAX_WORKERS             = int(os.getenv("MAX_WORKERS", "10"))
 RETRY_LIMIT             = int(os.getenv("RETRY_LIMIT", "3"))
 WALLET_FILE             = os.getenv("WALLET_FILE", "wallets.txt")
-GAS_BUFFER_MULTIPLIER   = float(os.getenv("GAS_BUFFER_MULTIPLIER", "1.1"))
+GAS_BUFFER_MULTIPLIER   = float(os.getenv("GAS_BUFFER_MULTIPLIER", "1.15"))
 WAIT_FOR_RECEIPT        = bool_from_env("WAIT_FOR_RECEIPT", False)
 RECEIPT_TIMEOUT         = int(os.getenv("RECEIPT_TIMEOUT", "120"))
 PRIORITY_FEE_GWEI       = int(os.getenv("PRIORITY_FEE_GWEI", "2"))
+TX_DELAY_SECONDS        = float(os.getenv("TX_DELAY_SECONDS", "0.5"))
+DRY_RUN                 = bool_from_env("DRY_RUN", False)
 
 if not INFURA_URL or not RECIPIENT_ADDRESS:
     raise EnvironmentError("Missing required environment variables: INFURA_URL or RECIPIENT_ADDRESS")
@@ -53,11 +57,18 @@ if not web3.is_connected():
     logger.critical("Failed to connect to Ethereum node. Check INFURA_URL.")
     raise ConnectionError("Web3 connection failed")
 
+CHAIN_ID = web3.eth.chain_id
+logger.info(f"Connected to Ethereum chain ID: {CHAIN_ID}")
+
 # ============================================================
 #                      UTILITIES
 # ============================================================
 def eth_fmt(wei: int) -> str:
     return f"{web3.from_wei(wei, 'ether'):.6f} ETH"
+
+def thread_safe_log(level: str, message: str):
+    with log_lock:
+        getattr(logger, level)(message)
 
 def load_wallets(file_path: str) -> List[Tuple[str, str]]:
     wallets = []
@@ -68,8 +79,11 @@ def load_wallets(file_path: str) -> List[Tuple[str, str]]:
                 if not line or line.startswith("#"):
                     continue
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) == 2 and len(parts[1]) > 30:
-                    wallets.append((parts[0], parts[1]))
+                if len(parts) != 2:
+                    continue
+                addr, key = parts
+                if web3.is_address(addr) and len(key) > 30:
+                    wallets.append((web3.to_checksum_address(addr), key))
         if not wallets:
             raise ValueError("Wallet file is empty or invalid.")
         return wallets
@@ -78,20 +92,30 @@ def load_wallets(file_path: str) -> List[Tuple[str, str]]:
         raise
 
 def get_gas_price() -> int:
+    """Return standard gas price (legacy)."""
     return web3.to_wei(GAS_PRICE_GWEI, "gwei") if GAS_PRICE_GWEI > 0 else web3.eth.gas_price
 
 def get_eip1559_fees() -> Dict[str, int]:
-    history = web3.eth.fee_history(1, "latest")
-    base_fee = history["baseFeePerGas"][-1]
-    priority_fee = web3.to_wei(PRIORITY_FEE_GWEI, "gwei")
-    max_fee = int(base_fee * 2 + priority_fee)
-    return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority_fee}
+    """Return dynamic maxFeePerGas and maxPriorityFeePerGas."""
+    try:
+        history = web3.eth.fee_history(5, "latest")
+        base_fee = history["baseFeePerGas"][-1]
+        priority_fee = web3.eth.max_priority_fee if hasattr(web3.eth, "max_priority_fee") else web3.to_wei(PRIORITY_FEE_GWEI, "gwei")
+        max_fee = int(base_fee * 2 + priority_fee)
+        return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority_fee}
+    except Exception:
+        # fallback
+        return {"maxFeePerGas": get_gas_price(), "maxPriorityFeePerGas": web3.to_wei(PRIORITY_FEE_GWEI, "gwei")}
 
 def estimate_fee(sender_address: str) -> Tuple[int, int]:
     tx = {"from": sender_address, "to": RECIPIENT_ADDRESS, "value": 1}
     base_gas = web3.eth.estimate_gas(tx)
     gas_limit = max(int(base_gas * GAS_BUFFER_MULTIPLIER), 21_000)
-    gas_price = get_gas_price()
+    if USE_EIP1559:
+        fees = get_eip1559_fees()
+        gas_price = fees["maxFeePerGas"]
+    else:
+        gas_price = get_gas_price()
     return gas_limit, gas_limit * gas_price
 
 def retry_with_backoff(fn: Callable[..., Any], retries: int, *args, **kwargs) -> Any:
@@ -101,10 +125,10 @@ def retry_with_backoff(fn: Callable[..., Any], retries: int, *args, **kwargs) ->
         except Exception as e:
             if attempt < retries:
                 delay = min(2 ** attempt, 30)
-                logger.warning(f"{fn.__name__} failed ({attempt+1}/{retries}): {e}. Retrying in {delay}s...")
+                thread_safe_log("warning", f"{fn.__name__} failed ({attempt+1}/{retries}): {e}. Retrying in {delay}s...")
                 time.sleep(delay)
             else:
-                logger.error(f"{fn.__name__} failed after {retries} attempts: {e}")
+                thread_safe_log("error", f"{fn.__name__} failed after {retries} attempts: {e}")
                 raise
 
 # ============================================================
@@ -112,53 +136,63 @@ def retry_with_backoff(fn: Callable[..., Any], retries: int, *args, **kwargs) ->
 # ============================================================
 def send_eth(wallet_address: str, private_key: str, index: int) -> None:
     """Transfer all ETH from a wallet, leaving enough for gas."""
+    thread_safe_log("info", f"[{index}] Processing {wallet_address}...")
     try:
         balance = retry_with_backoff(web3.eth.get_balance, RETRY_LIMIT, wallet_address)
         if balance == 0:
-            logger.info(f"[{index}] {wallet_address} has zero balance, skipping.")
+            thread_safe_log("info", f"[{index}] {wallet_address} has zero balance, skipping.")
             return
 
         gas_limit, est_fee = retry_with_backoff(estimate_fee, RETRY_LIMIT, wallet_address)
         if balance <= est_fee:
-            logger.info(f"[{index}] Insufficient funds in {wallet_address}. "
-                        f"Balance: {eth_fmt(balance)}, Fee: {eth_fmt(est_fee)}")
+            thread_safe_log("info", f"[{index}] Insufficient funds. Balance: {eth_fmt(balance)}, Fee: {eth_fmt(est_fee)}")
             return
 
         value = balance - est_fee
         nonce = retry_with_backoff(web3.eth.get_transaction_count, RETRY_LIMIT, wallet_address)
 
-        tx = {
+        tx: Dict[str, Any] = {
             "nonce": nonce,
             "to": RECIPIENT_ADDRESS,
             "value": value,
             "gas": gas_limit,
-            "chainId": web3.eth.chain_id,
+            "chainId": CHAIN_ID,
         }
 
         tx.update(get_eip1559_fees() if USE_EIP1559 else {"gasPrice": get_gas_price()})
 
+        if DRY_RUN:
+            thread_safe_log("info", f"[{index}] DRY RUN: would send {eth_fmt(value)} from {wallet_address}")
+            return
+
         signed_tx = web3.eth.account.sign_transaction(tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
         tx_hex = web3.to_hex(tx_hash)
-        logger.info(f"[{index}] Sent {eth_fmt(value)} from {wallet_address}. TX: {tx_hex}")
+
+        thread_safe_log("info", f"[{index}] Sent {eth_fmt(value)} from {wallet_address}. TX: {tx_hex}")
 
         if WAIT_FOR_RECEIPT:
             try:
                 receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT)
-                status = "Success ✅" if receipt["status"] == 1 else "Failed ❌"
-                logger.info(f"[{index}] TX {tx_hex} confirmed: {status}")
+                status = "✅ Success" if receipt["status"] == 1 else "❌ Failed"
+                thread_safe_log("info", f"[{index}] TX {tx_hex} confirmed: {status}")
             except Exception as e:
-                logger.error(f"[{index}] Timeout/error waiting for TX {tx_hex}: {e}")
+                thread_safe_log("error", f"[{index}] Timeout/error waiting for TX {tx_hex}: {e}")
+
+        time.sleep(TX_DELAY_SECONDS)
 
     except (ValueError, Timeout) as e:
-        logger.error(f"[{index}] RPC/Timeout error for {wallet_address}: {e}")
+        thread_safe_log("error", f"[{index}] RPC/Timeout error: {e}")
     except Exception as e:
-        logger.exception(f"[{index}] Unexpected error: {e}")
+        thread_safe_log("exception", f"[{index}] Unexpected error: {e}")
 
 # ============================================================
 #                      CONCURRENT EXECUTION
 # ============================================================
 def process_wallets(wallets: List[Tuple[str, str]]) -> None:
+    total = len(wallets)
+    thread_safe_log("info", f"Processing {total} wallets with {MAX_WORKERS} threads...")
+    success, failed = 0, 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(send_eth, addr, key, i): (addr, i)
@@ -168,8 +202,10 @@ def process_wallets(wallets: List[Tuple[str, str]]) -> None:
             addr, i = futures[future]
             try:
                 future.result()
-            except Exception as e:
-                logger.error(f"[{i}] Wallet {addr} failed: {e}")
+                success += 1
+            except Exception:
+                failed += 1
+    thread_safe_log("info", f"Completed. ✅ {success} succeeded, ❌ {failed} failed.")
 
 # ============================================================
 #                      GRACEFUL EXIT
@@ -187,7 +223,6 @@ def main() -> None:
     try:
         start = time.time()
         wallets = load_wallets(WALLET_FILE)
-        logger.info(f"Loaded {len(wallets)} wallets. Starting transfers...")
         process_wallets(wallets)
         elapsed = time.time() - start
         logger.info(f"All transfers completed in {elapsed:.2f} seconds.")
