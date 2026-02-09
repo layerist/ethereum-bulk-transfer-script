@@ -100,7 +100,7 @@ def retry(
     fn: Callable[..., Any],
     *args,
     retries: int = RETRY_LIMIT,
-    retry_on: tuple[type, ...] = (Exception,),
+    retry_on: tuple[type, ...] = (Timeout, TransactionNotFound),
     **kwargs,
 ) -> Any:
     for attempt in range(1, retries + 2):
@@ -130,7 +130,7 @@ def load_wallets(path: str) -> List[Tuple[str, str]]:
                 addr, pk = map(str.strip, line.split(",", 1))
                 if not web3.is_address(addr):
                     raise ValueError("Invalid address")
-                if len(pk) < 32:
+                if not pk.startswith("0x") or len(pk) != 66:
                     raise ValueError("Invalid private key")
                 wallets.append((web3.to_checksum_address(addr), pk))
             except Exception as e:
@@ -163,13 +163,15 @@ def eip1559_fees() -> Dict[str, int]:
     except Exception:
         priority = web3.to_wei(PRIORITY_FEE_GWEI, "gwei")
 
+    max_fee = int(base_fee * 2 + priority)
+
     return {
         "maxPriorityFeePerGas": priority,
-        "maxFeePerGas": int(base_fee * 2 + priority),
+        "maxFeePerGas": max_fee,
     }
 
 
-def estimate_fee(sender: str) -> tuple[int, int]:
+def estimate_fee(sender: str) -> tuple[int, Dict[str, int]]:
     gas_estimate = retry(
         web3.eth.estimate_gas,
         {"from": sender, "to": RECIPIENT_ADDRESS, "value": 1},
@@ -179,10 +181,10 @@ def estimate_fee(sender: str) -> tuple[int, int]:
 
     if USE_EIP1559:
         fees = eip1559_fees()
-        return gas_limit, gas_limit * fees["maxFeePerGas"]
+        return gas_limit, fees
 
     gp = legacy_gas_price()
-    return gas_limit, gas_limit * gp
+    return gas_limit, {"gasPrice": gp}
 
 
 # ============================================================
@@ -197,13 +199,20 @@ def send_eth(address: str, private_key: str, idx: int) -> bool:
             log("info", f"[{idx}] Zero balance")
             return True
 
-        gas_limit, fee = estimate_fee(address)
-        if balance <= fee:
+        gas_limit, fee_fields = estimate_fee(address)
+
+        fee_cost = (
+            gas_limit * fee_fields["maxFeePerGas"]
+            if USE_EIP1559
+            else gas_limit * fee_fields["gasPrice"]
+        )
+
+        if balance <= fee_cost:
             log("info", f"[{idx}] Insufficient balance ({eth_fmt(balance)})")
             return True
 
         nonce = retry(web3.eth.get_transaction_count, address, "pending")
-        value = balance - fee
+        value = balance - fee_cost
 
         tx: Dict[str, Any] = {
             "chainId": CHAIN_ID,
@@ -211,9 +220,8 @@ def send_eth(address: str, private_key: str, idx: int) -> bool:
             "to": RECIPIENT_ADDRESS,
             "value": value,
             "gas": gas_limit,
+            **fee_fields,
         }
-
-        tx.update(eip1559_fees() if USE_EIP1559 else {"gasPrice": legacy_gas_price()})
 
         if DRY_RUN:
             log("info", f"[{idx}] DRY RUN → {eth_fmt(value)}")
@@ -237,8 +245,10 @@ def send_eth(address: str, private_key: str, idx: int) -> bool:
         time.sleep(TX_DELAY_SECONDS)
         return True
 
-    except (Timeout, TransactionNotFound, ValueError) as e:
+    except (Timeout, TransactionNotFound) as e:
         log("error", f"[{idx}] RPC error: {e}")
+    except ValueError as e:
+        log("error", f"[{idx}] TX rejected: {e}")
     except Exception as e:
         log("exception", f"[{idx}] Unexpected error: {e}")
 
@@ -265,11 +275,11 @@ def process_wallets(wallets: List[Tuple[str, str]]) -> None:
     ok = failed = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(send_eth, addr, pk, i): i
+        futures = [
+            pool.submit(send_eth, addr, pk, i)
             for i, (addr, pk) in enumerate(wallets)
             if not _stop_event.is_set()
-        }
+        ]
 
         for f in as_completed(futures):
             if f.result():
