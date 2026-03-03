@@ -7,6 +7,7 @@ Design goals:
 - Deterministic behavior
 - Clear observability
 - Safe concurrent execution
+- Precision-safe math
 """
 
 from __future__ import annotations
@@ -16,17 +17,22 @@ import time
 import signal
 import logging
 import threading
+from decimal import Decimal
 from typing import List, Tuple, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from requests.exceptions import Timeout
+from requests.exceptions import Timeout, ConnectionError as ReqConnectionError
 from web3 import Web3
-from web3.exceptions import TransactionNotFound
-
+from web3.exceptions import (
+    TransactionNotFound,
+    TimeExhausted,
+    ContractLogicError,
+)
 
 # ============================================================
 #                         LOGGING
 # ============================================================
+
 LOG_FILE = "transfer_log.txt"
 
 logging.basicConfig(
@@ -50,6 +56,7 @@ def log(level: str, msg: str) -> None:
 # ============================================================
 #                         CONFIG
 # ============================================================
+
 def env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     return default if v is None else v.strip().lower() in {"1", "true", "yes", "on"}
@@ -79,7 +86,9 @@ if not INFURA_URL or not RECIPIENT_ADDRESS:
 # ============================================================
 #                         WEB3
 # ============================================================
+
 web3 = Web3(Web3.HTTPProvider(INFURA_URL, request_kwargs={"timeout": 20}))
+
 if not web3.is_connected():
     raise ConnectionError("Failed to connect to Ethereum RPC")
 
@@ -92,15 +101,22 @@ logger.info("Connected to chain ID %s", CHAIN_ID)
 # ============================================================
 #                         UTILS
 # ============================================================
+
 def eth_fmt(wei: int) -> str:
-    return f"{web3.from_wei(wei, 'ether'):.6f} ETH"
+    eth = Decimal(wei) / Decimal(10**18)
+    return f"{eth:.6f} ETH"
 
 
 def retry(
     fn: Callable[..., Any],
     *args,
     retries: int = RETRY_LIMIT,
-    retry_on: tuple[type, ...] = (Timeout, TransactionNotFound),
+    retry_on: tuple[type, ...] = (
+        Timeout,
+        ReqConnectionError,
+        TransactionNotFound,
+        TimeExhausted,
+    ),
     **kwargs,
 ) -> Any:
     for attempt in range(1, retries + 2):
@@ -117,6 +133,7 @@ def retry(
 # ============================================================
 #                         WALLETS
 # ============================================================
+
 def load_wallets(path: str) -> List[Tuple[str, str]]:
     wallets: List[Tuple[str, str]] = []
 
@@ -132,7 +149,9 @@ def load_wallets(path: str) -> List[Tuple[str, str]]:
                     raise ValueError("Invalid address")
                 if not pk.startswith("0x") or len(pk) != 66:
                     raise ValueError("Invalid private key")
+
                 wallets.append((web3.to_checksum_address(addr), pk))
+
             except Exception as e:
                 log("warning", f"Invalid wallet entry at line {ln}: {e}")
 
@@ -145,6 +164,7 @@ def load_wallets(path: str) -> List[Tuple[str, str]]:
 # ============================================================
 #                         GAS
 # ============================================================
+
 def legacy_gas_price() -> int:
     if GAS_PRICE_GWEI > 0:
         return web3.to_wei(GAS_PRICE_GWEI, "gwei")
@@ -152,11 +172,12 @@ def legacy_gas_price() -> int:
 
 
 def eip1559_fees() -> Dict[str, int]:
-    try:
-        block = retry(web3.eth.get_block, "latest")
-        base_fee = block["baseFeePerGas"]
-    except Exception:
-        base_fee = legacy_gas_price()
+    block = retry(web3.eth.get_block, "latest")
+    base_fee = block.get("baseFeePerGas")
+
+    if base_fee is None:
+        # Fallback if RPC doesn't support 1559
+        return {"gasPrice": legacy_gas_price()}
 
     try:
         priority = retry(web3.eth.max_priority_fee)
@@ -180,16 +201,15 @@ def estimate_fee(sender: str) -> tuple[int, Dict[str, int]]:
     gas_limit = max(int(gas_estimate * GAS_BUFFER_MULTIPLIER), 21_000)
 
     if USE_EIP1559:
-        fees = eip1559_fees()
-        return gas_limit, fees
+        return gas_limit, eip1559_fees()
 
-    gp = legacy_gas_price()
-    return gas_limit, {"gasPrice": gp}
+    return gas_limit, {"gasPrice": legacy_gas_price()}
 
 
 # ============================================================
 #                         TRANSFER
 # ============================================================
+
 def send_eth(address: str, private_key: str, idx: int) -> bool:
     try:
         log("info", f"[{idx}] Wallet {address}")
@@ -201,11 +221,11 @@ def send_eth(address: str, private_key: str, idx: int) -> bool:
 
         gas_limit, fee_fields = estimate_fee(address)
 
-        fee_cost = (
-            gas_limit * fee_fields["maxFeePerGas"]
-            if USE_EIP1559
-            else gas_limit * fee_fields["gasPrice"]
-        )
+        # Worst-case cost
+        if "maxFeePerGas" in fee_fields:
+            fee_cost = gas_limit * fee_fields["maxFeePerGas"]
+        else:
+            fee_cost = gas_limit * fee_fields["gasPrice"]
 
         if balance <= fee_cost:
             log("info", f"[{idx}] Insufficient balance ({eth_fmt(balance)})")
@@ -228,9 +248,14 @@ def send_eth(address: str, private_key: str, idx: int) -> bool:
             return True
 
         signed = web3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = retry(web3.eth.send_raw_transaction, signed.rawTransaction)
-        tx_hex = web3.to_hex(tx_hash)
 
+        try:
+            tx_hash = retry(web3.eth.send_raw_transaction, signed.rawTransaction)
+        except ValueError as e:
+            log("error", f"[{idx}] TX rejected: {e}")
+            return False
+
+        tx_hex = web3.to_hex(tx_hash)
         log("info", f"[{idx}] Sent {eth_fmt(value)} → {tx_hex}")
 
         if WAIT_FOR_RECEIPT:
@@ -245,24 +270,20 @@ def send_eth(address: str, private_key: str, idx: int) -> bool:
         time.sleep(TX_DELAY_SECONDS)
         return True
 
-    except (Timeout, TransactionNotFound) as e:
-        log("error", f"[{idx}] RPC error: {e}")
-    except ValueError as e:
-        log("error", f"[{idx}] TX rejected: {e}")
     except Exception as e:
         log("exception", f"[{idx}] Unexpected error: {e}")
-
-    return False
+        return False
 
 
 # ============================================================
 #                         EXECUTION
 # ============================================================
+
 _stop_event = threading.Event()
 
 
 def handle_sigint(sig, frame):
-    logger.warning("SIGINT received → stopping new submissions")
+    logger.warning("SIGINT received → graceful shutdown")
     _stop_event.set()
 
 
@@ -275,16 +296,20 @@ def process_wallets(wallets: List[Tuple[str, str]]) -> None:
     ok = failed = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = [
-            pool.submit(send_eth, addr, pk, i)
-            for i, (addr, pk) in enumerate(wallets)
-            if not _stop_event.is_set()
-        ]
+        futures = []
+
+        for i, (addr, pk) in enumerate(wallets):
+            if _stop_event.is_set():
+                break
+            futures.append(pool.submit(send_eth, addr, pk, i))
 
         for f in as_completed(futures):
-            if f.result():
-                ok += 1
-            else:
+            try:
+                if f.result():
+                    ok += 1
+                else:
+                    failed += 1
+            except Exception:
                 failed += 1
 
     log("info", f"Completed: {ok} success, {failed} failed")
@@ -293,6 +318,7 @@ def process_wallets(wallets: List[Tuple[str, str]]) -> None:
 # ============================================================
 #                         MAIN
 # ============================================================
+
 def main() -> None:
     start = time.time()
     wallets = load_wallets(WALLET_FILE)
