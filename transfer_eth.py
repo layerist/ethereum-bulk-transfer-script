@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable ETH Batch Payout Service v2
+Reliable ETH Batch Payout Service v3
 
 Purpose:
 - Send fixed ETH amounts from one treasury wallet to multiple recipients.
@@ -20,7 +20,7 @@ Required environment:
 Optional environment:
   TREASURY_ADDRESS="0x..."          must match PRIVATE_KEY
   RECIPIENTS_FILE="recipients.json"
-  STATE_FILE="payout_state.jsonl"
+  STATE_FILE="payout_state_v3.jsonl"
   LOCK_FILE="payout.lock"
 
   DRY_RUN=false
@@ -47,17 +47,21 @@ Optional environment:
   MAX_RECIPIENTS=10000
   MAX_TOTAL_ETH=0                     0 = disabled
   CONTINUE_AFTER_RECEIPT_TIMEOUT=false
+  RESUME=true                         skip recipients already confirmed in this exact batch
+  STALE_LOCK_SECONDS=300            remove dead local lock after this age; 0 = never
   LOG_LEVEL=INFO
 """
 
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import os
 import random
 import signal
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -143,6 +147,8 @@ class Config:
     max_recipients: int
     max_total_eth: Decimal
     continue_after_receipt_timeout: bool
+    resume: bool
+    stale_lock_seconds: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -152,7 +158,7 @@ class Config:
             private_key=os.getenv("PRIVATE_KEY", "").strip(),
             treasury_address=os.getenv("TREASURY_ADDRESS", "").strip(),
             recipients_file=Path(os.getenv("RECIPIENTS_FILE", "recipients.json")),
-            state_file=Path(os.getenv("STATE_FILE", "payout_state.jsonl")),
+            state_file=Path(os.getenv("STATE_FILE", "payout_state_v3.jsonl")),
             lock_file=Path(os.getenv("LOCK_FILE", "payout.lock")),
             dry_run=env_bool("DRY_RUN", False),
             chain_id_override=env_int("CHAIN_ID", 0, 0),
@@ -175,6 +181,8 @@ class Config:
             max_recipients=env_int("MAX_RECIPIENTS", 10_000, 1),
             max_total_eth=env_decimal("MAX_TOTAL_ETH", "0", Decimal("0")),
             continue_after_receipt_timeout=env_bool("CONTINUE_AFTER_RECEIPT_TIMEOUT", False),
+            resume=env_bool("RESUME", True),
+            stale_lock_seconds=env_int("STALE_LOCK_SECONDS", 300, 0),
         )
         cfg.validate()
         return cfg
@@ -199,7 +207,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("eth-batch-v2")
+log = logging.getLogger("eth-batch-v3")
 
 
 # -----------------------------------------------------------------------------
@@ -322,21 +330,78 @@ def request_stop(signum: int, _frame: Any) -> None:
 # -----------------------------------------------------------------------------
 
 class ProcessLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, stale_after_seconds: int):
         self.path = path
+        self.stale_after_seconds = stale_after_seconds
         self.acquired = False
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _read_existing(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _remove_stale_local_lock(self) -> bool:
+        if not self.path.exists():
+            return True
+        info = self._read_existing()
+        pid = int(info.get("pid", 0) or 0)
+        host = str(info.get("host", ""))
+        started_at = int(info.get("started_at", 0) or 0)
+        age = max(0, int(time.time()) - started_at) if started_at else None
+        same_host = not host or host == socket.gethostname()
+        dead_local_process = same_host and pid > 0 and not self._pid_is_alive(pid)
+        old_enough = (
+            self.stale_after_seconds > 0
+            and age is not None
+            and age >= self.stale_after_seconds
+        )
+        if dead_local_process and old_enough:
+            log.warning(
+                "Removing stale lock %s pid=%s age=%ss", self.path, pid, age
+            )
+            self.path.unlink(missing_ok=True)
+            return True
+        return False
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as exc:
-            raise RuntimeError(
-                f"Lock file already exists: {self.path}. Another payout process may be running. "
-                "Remove it only after confirming no process is active."
-            ) from exc
+        for attempt in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                break
+            except FileExistsError as exc:
+                if attempt == 0 and self._remove_stale_local_lock():
+                    continue
+                info = self._read_existing()
+                raise RuntimeError(
+                    f"Lock file already exists: {self.path}; details={info or 'unreadable'}. "
+                    "Another payout process may be running. Remove it only after confirming no process is active."
+                ) from exc
+        else:
+            raise RuntimeError(f"Unable to acquire lock: {self.path}")
+
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"pid": os.getpid(), "started_at": int(time.time())}) + "\n")
+            handle.write(json.dumps({
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "started_at": int(time.time()),
+            }) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         self.acquired = True
@@ -351,17 +416,39 @@ class ProcessLock:
 
 
 class AuditLog:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, context: Optional[dict[str, Any]] = None):
         self.path = path
+        self.context = dict(context or {})
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
+    def set_context(self, **fields: Any) -> None:
+        self.context.update(fields)
+
     def write(self, event: str, **fields: Any) -> None:
-        record = {"ts": int(time.time()), "event": event, **fields}
+        record = {"ts": int(time.time()), **self.context, "event": event, **fields}
         line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+
+    def records_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        if not self.path.is_file():
+            return []
+        records: list[dict[str, Any]] = []
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("Ignoring malformed audit line %s in %s", line_no, self.path)
+                    continue
+                if isinstance(item, dict) and item.get("batch_id") == batch_id:
+                    records.append(item)
+        return records
 
 
 # -----------------------------------------------------------------------------
@@ -592,6 +679,69 @@ def preflight(
             f"required={wei_to_eth_str(required)}"
         )
     return fees, gas_limits
+
+
+def make_batch_id(chain_id: int, treasury: str, recipients: Sequence[Recipient]) -> str:
+    payload = {
+        "chain_id": chain_id,
+        "treasury": treasury.lower(),
+        "recipients": [
+            {"idx": r.idx, "to": r.to.lower(), "value_wei": r.value_wei}
+            for r in recipients
+        ],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def recover_batch_progress(
+    audit: AuditLog, batch_id: str, recipients: Sequence[Recipient], resume: bool
+) -> set[int]:
+    if not resume:
+        return set()
+    records = audit.records_for_batch(batch_id)
+    if not records:
+        return set()
+
+    confirmed: set[int] = set()
+    ambiguous: dict[int, tuple[str, Optional[str]]] = {}
+    terminal_safe = {"confirmed", "dry_run"}
+    broadcast_events = {
+        "sent", "already_known", "found_after_send_error", "send_unknown",
+        "nonce_consumed", "nonce_conflict_unresolved",
+    }
+
+    for record in records:
+        idx_raw = record.get("idx")
+        if not isinstance(idx_raw, int):
+            continue
+        event = str(record.get("event", ""))
+        status = str(record.get("status", ""))
+        tx_hash = record.get("tx_hash")
+        if event == "receipt" and status in terminal_safe:
+            confirmed.add(idx_raw)
+            ambiguous.pop(idx_raw, None)
+        elif event == "dry_run":
+            confirmed.add(idx_raw)
+            ambiguous.pop(idx_raw, None)
+        elif event in broadcast_events or (event == "receipt" and status != "confirmed"):
+            if idx_raw not in confirmed:
+                ambiguous[idx_raw] = (status or event, str(tx_hash) if tx_hash else None)
+
+    valid_indices = {r.idx for r in recipients}
+    confirmed &= valid_indices
+    ambiguous = {idx: value for idx, value in ambiguous.items() if idx in valid_indices}
+    if ambiguous:
+        details = ", ".join(
+            f"#{idx}:{status}:{tx_hash or '-'}"
+            for idx, (status, tx_hash) in sorted(ambiguous.items())
+        )
+        raise RuntimeError(
+            "Previous run contains transactions with an unresolved/possibly broadcast state: "
+            f"{details}. Refusing automatic resend to prevent duplicate payouts. "
+            "Resolve these hashes on-chain, then mark them confirmed in the audit log or use a new state file."
+        )
+    return confirmed
 
 
 # -----------------------------------------------------------------------------
@@ -835,7 +985,7 @@ def send_one(
 
 def run() -> int:
     cfg = Config.from_env()
-    lock = ProcessLock(cfg.lock_file)
+    lock = ProcessLock(cfg.lock_file, cfg.stale_lock_seconds)
     lock.acquire()
     audit = AuditLog(cfg.state_file)
 
@@ -857,7 +1007,18 @@ def run() -> int:
 
     rpc = RPCPool(cfg)
     chain_id = rpc.validate_nodes()
-    fees, gas_limits = preflight(rpc, cfg, treasury, recipients)
+    batch_id = make_batch_id(chain_id, treasury, recipients)
+    audit.set_context(batch_id=batch_id, chain_id=chain_id, treasury=treasury)
+    completed_indices = recover_batch_progress(audit, batch_id, recipients, cfg.resume)
+    pending_recipients = [r for r in recipients if r.idx not in completed_indices]
+    if completed_indices:
+        log.info("Resuming batch %s: already confirmed=%s", batch_id[:12], len(completed_indices))
+    if not pending_recipients:
+        log.info("Batch %s is already complete", batch_id[:12])
+        audit.write("batch_already_complete", recipients=len(recipients))
+        return 0
+    fees, pending_gas_limits = preflight(rpc, cfg, treasury, pending_recipients)
+    gas_by_idx = {r.idx: gas for r, gas in zip(pending_recipients, pending_gas_limits)}
     nonce = int(rpc.call(
         "get_pending_nonce",
         lambda w3: w3.eth.get_transaction_count(treasury, "pending"),
@@ -865,18 +1026,19 @@ def run() -> int:
 
     audit.write(
         "batch_start",
-        chain_id=chain_id,
-        treasury=treasury,
         recipients=len(recipients),
+        remaining=len(pending_recipients),
         starting_nonce=nonce,
         dry_run=cfg.dry_run,
     )
     log.info("Chain ID: %s", chain_id)
+    log.info("Batch ID: %s", batch_id)
     log.info("Starting nonce: %s", nonce)
 
     success = 0
     failed = 0
-    for position, (recipient, gas_limit) in enumerate(zip(recipients, gas_limits), 1):
+    for position, recipient in enumerate(pending_recipients, 1):
+        gas_limit = gas_by_idx[recipient.idx]
         if STOP_REQUESTED:
             audit.write("batch_interrupted", next_idx=recipient.idx, nonce=nonce)
             return 130
