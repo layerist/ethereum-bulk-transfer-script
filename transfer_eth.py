@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable ETH Batch Payout Service v3
+Reliable ETH Batch Payout Service v4
 
 Purpose:
 - Send fixed ETH amounts from one treasury wallet to multiple recipients.
@@ -20,7 +20,7 @@ Required environment:
 Optional environment:
   TREASURY_ADDRESS="0x..."          must match PRIVATE_KEY
   RECIPIENTS_FILE="recipients.json"
-  STATE_FILE="payout_state_v3.jsonl"
+  STATE_FILE="payout_state_v4.jsonl"
   LOCK_FILE="payout.lock"
 
   DRY_RUN=false
@@ -48,6 +48,7 @@ Optional environment:
   MAX_TOTAL_ETH=0                     0 = disabled
   CONTINUE_AFTER_RECEIPT_TIMEOUT=false
   RESUME=true                         skip recipients already confirmed in this exact batch
+                                      and reconcile crash-window prepared transactions on-chain
   STALE_LOCK_SECONDS=300            remove dead local lock after this age; 0 = never
   LOG_LEVEL=INFO
 """
@@ -198,8 +199,20 @@ class Config:
             raise ValueError("PRIORITY_FEE_GWEI exceeds MAX_PRIORITY_FEE_GWEI")
         if self.max_priority_fee_gwei > self.max_fee_cap_gwei:
             raise ValueError("MAX_PRIORITY_FEE_GWEI exceeds MAX_FEE_CAP_GWEI")
-        if self.state_file.resolve() == self.recipients_file.resolve():
-            raise ValueError("STATE_FILE must differ from RECIPIENTS_FILE")
+        resolved = {
+            "RECIPIENTS_FILE": self.recipients_file.resolve(),
+            "STATE_FILE": self.state_file.resolve(),
+            "LOCK_FILE": self.lock_file.resolve(),
+        }
+        if len(set(resolved.values())) != len(resolved):
+            raise ValueError(
+                "RECIPIENTS_FILE, STATE_FILE and LOCK_FILE must all point to different files"
+            )
+
+        for url in self.rpc_urls:
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(f"Invalid RPC URL: {redact_url(url)}")
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -694,53 +707,216 @@ def make_batch_id(chain_id: int, treasury: str, recipients: Sequence[Recipient])
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _query_tx_state_across_nodes(
+    rpc: RPCPool,
+    treasury: str,
+    nonce: int,
+    tx_hash: str,
+) -> tuple[str, Optional[Any]]:
+    """
+    Conservatively reconcile a transaction across every validated RPC node.
+
+    Returns:
+      ("confirmed", receipt)  - successful receipt observed
+      ("reverted", receipt)   - failed receipt observed
+      ("known", None)         - tx is known/pending but has no receipt yet
+      ("not_broadcast", None) - every responsive RPC says tx is unknown and
+                                no observed nonce has advanced beyond this nonce
+      ("ambiguous", None)     - inconsistent/unavailable evidence; manual review
+    """
+    responsive = 0
+    known = False
+    successful_receipt: Optional[Any] = None
+    reverted_receipt: Optional[Any] = None
+    pending_nonces: list[int] = []
+    latest_nonces: list[int] = []
+
+    for node in rpc.nodes:
+        try:
+            responsive += 1
+
+            try:
+                receipt = node.w3.eth.get_transaction_receipt(tx_hash)
+            except TransactionNotFound:
+                receipt = None
+
+            if receipt is not None:
+                known = True
+                if int(receipt.get("status", 0)) == 1:
+                    successful_receipt = receipt
+                else:
+                    reverted_receipt = receipt
+
+            try:
+                node.w3.eth.get_transaction(tx_hash)
+                known = True
+            except TransactionNotFound:
+                pass
+
+            pending_nonces.append(int(node.w3.eth.get_transaction_count(treasury, "pending")))
+            latest_nonces.append(int(node.w3.eth.get_transaction_count(treasury, "latest")))
+        except Exception as exc:
+            log.warning(
+                "Resume reconciliation RPC failed rpc=%s tx=%s error=%s",
+                redact_url(node.url), tx_hash, exc,
+            )
+
+    if responsive == 0:
+        return "ambiguous", None
+
+    if successful_receipt is not None and reverted_receipt is not None:
+        # Nodes disagree on canonical-chain state. Never guess.
+        return "ambiguous", None
+    if successful_receipt is not None:
+        return "confirmed", successful_receipt
+    if reverted_receipt is not None:
+        return "reverted", reverted_receipt
+    if known:
+        return "known", None
+
+    # Safe automatic retry is allowed only when every responsive observation
+    # shows that neither pending nor mined nonce has advanced past this nonce.
+    if (
+        pending_nonces
+        and latest_nonces
+        and max(pending_nonces) <= nonce
+        and max(latest_nonces) <= nonce
+    ):
+        return "not_broadcast", None
+
+    return "ambiguous", None
+
+
 def recover_batch_progress(
-    audit: AuditLog, batch_id: str, recipients: Sequence[Recipient], resume: bool
+    audit: AuditLog,
+    batch_id: str,
+    recipients: Sequence[Recipient],
+    resume: bool,
+    rpc: RPCPool,
+    treasury: str,
+    cfg: Config,
 ) -> set[int]:
+    """
+    Recover only payouts proven complete.
+
+    Critical invariant:
+    a prior "prepared" record is NOT silently ignored. It may represent the
+    crash window where eth_sendRawTransaction succeeded but the process died
+    before the "sent" audit record was fsynced.
+    """
     if not resume:
         return set()
+
     records = audit.records_for_batch(batch_id)
     if not records:
         return set()
 
+    valid_indices = {r.idx for r in recipients}
     confirmed: set[int] = set()
-    ambiguous: dict[int, tuple[str, Optional[str]]] = {}
-    terminal_safe = {"confirmed", "dry_run"}
-    broadcast_events = {
-        "sent", "already_known", "found_after_send_error", "send_unknown",
-        "nonce_consumed", "nonce_conflict_unresolved",
+    unresolved: dict[int, dict[str, Any]] = {}
+
+    broadcastish_events = {
+        "prepared",
+        "sent",
+        "already_known",
+        "found_after_send_error",
+        "send_unknown",
+        "nonce_consumed",
+        "nonce_conflict_unresolved",
     }
 
     for record in records:
-        idx_raw = record.get("idx")
-        if not isinstance(idx_raw, int):
+        idx = record.get("idx")
+        if not isinstance(idx, int) or idx not in valid_indices:
             continue
+
         event = str(record.get("event", ""))
         status = str(record.get("status", ""))
-        tx_hash = record.get("tx_hash")
-        if event == "receipt" and status in terminal_safe:
-            confirmed.add(idx_raw)
-            ambiguous.pop(idx_raw, None)
-        elif event == "dry_run":
-            confirmed.add(idx_raw)
-            ambiguous.pop(idx_raw, None)
-        elif event in broadcast_events or (event == "receipt" and status != "confirmed"):
-            if idx_raw not in confirmed:
-                ambiguous[idx_raw] = (status or event, str(tx_hash) if tx_hash else None)
 
-    valid_indices = {r.idx for r in recipients}
-    confirmed &= valid_indices
-    ambiguous = {idx: value for idx, value in ambiguous.items() if idx in valid_indices}
+        # DRY_RUN must never mark a real payout as complete. This fixes the v3
+        # bug where a later real run could skip recipients after a dry run.
+        if event == "dry_run":
+            continue
+
+        if (event == "receipt" and status == "confirmed") or event == "resume_reconciled_confirmed":
+            confirmed.add(idx)
+            unresolved.pop(idx, None)
+            continue
+
+        if idx in confirmed:
+            continue
+
+        if event in broadcastish_events or event == "receipt":
+            # Keep the most recent useful transaction evidence for this idx.
+            previous = unresolved.get(idx, {})
+            merged = dict(previous)
+            merged.update(record)
+            unresolved[idx] = merged
+
+    ambiguous: list[str] = []
+
+    for idx, record in sorted(unresolved.items()):
+        tx_hash_raw = record.get("tx_hash")
+        nonce_raw = record.get("nonce")
+        if not tx_hash_raw or not isinstance(nonce_raw, int):
+            ambiguous.append(f"#{idx}:missing_tx_evidence")
+            continue
+
+        tx_hash = str(tx_hash_raw)
+        nonce = int(nonce_raw)
+        state, receipt = _query_tx_state_across_nodes(
+            rpc, treasury, nonce, tx_hash
+        )
+
+        if state == "confirmed":
+            # Preserve the same confirmation policy used during the normal send
+            # path. A crash/restart must not silently weaken CONFIRMATIONS.
+            confirmation_status = wait_for_receipt(rpc, cfg, tx_hash)
+            if confirmation_status == "confirmed":
+                confirmed.add(idx)
+                audit.write(
+                    "resume_reconciled_confirmed",
+                    idx=idx,
+                    nonce=nonce,
+                    tx_hash=tx_hash,
+                    block_number=int(receipt["blockNumber"]) if receipt is not None else None,
+                )
+                log.warning(
+                    "Recovered recipient #%s as confirmed from on-chain state tx=%s",
+                    idx, tx_hash,
+                )
+                continue
+
+            ambiguous.append(
+                f"#{idx}:reconcile_{confirmation_status}:{tx_hash}"
+            )
+            continue
+
+        if state == "not_broadcast":
+            # Prepared-but-never-broadcast, or a failed send that is now proven
+            # absent while the nonce is still free. It is safe to retry.
+            audit.write(
+                "resume_reconciled_not_broadcast",
+                idx=idx,
+                nonce=nonce,
+                tx_hash=tx_hash,
+            )
+            log.warning(
+                "Recovered recipient #%s as safe-to-retry; tx not known and nonce=%s is still free",
+                idx, nonce,
+            )
+            continue
+
+        ambiguous.append(f"#{idx}:{state}:{tx_hash}")
+
     if ambiguous:
-        details = ", ".join(
-            f"#{idx}:{status}:{tx_hash or '-'}"
-            for idx, (status, tx_hash) in sorted(ambiguous.items())
-        )
         raise RuntimeError(
-            "Previous run contains transactions with an unresolved/possibly broadcast state: "
-            f"{details}. Refusing automatic resend to prevent duplicate payouts. "
-            "Resolve these hashes on-chain, then mark them confirmed in the audit log or use a new state file."
+            "Previous run contains unresolved transaction state: "
+            + ", ".join(ambiguous)
+            + ". Refusing automatic resend to prevent duplicate payouts. "
+              "Resolve these transactions on-chain before continuing."
         )
+
     return confirmed
 
 
@@ -885,7 +1061,8 @@ def send_one(
             nonce, gas_limit, tx_hash,
         )
         audit.write("dry_run", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash)
-        return SendResult(True, True, tx_hash, "dry_run")
+        # No chain nonce is consumed in dry-run mode.
+        return SendResult(True, False, tx_hash, "dry_run")
 
     last_error: Optional[BaseException] = None
     for attempt in range(1, cfg.retry_limit + 1):
@@ -1009,7 +1186,7 @@ def run() -> int:
     chain_id = rpc.validate_nodes()
     batch_id = make_batch_id(chain_id, treasury, recipients)
     audit.set_context(batch_id=batch_id, chain_id=chain_id, treasury=treasury)
-    completed_indices = recover_batch_progress(audit, batch_id, recipients, cfg.resume)
+    completed_indices = recover_batch_progress(audit, batch_id, recipients, cfg.resume, rpc, treasury, cfg)
     pending_recipients = [r for r in recipients if r.idx not in completed_indices]
     if completed_indices:
         log.info("Resuming batch %s: already confirmed=%s", batch_id[:12], len(completed_indices))
@@ -1062,7 +1239,7 @@ def run() -> int:
         result = send_one(
             rpc, cfg, audit, treasury, recipient, nonce, chain_id, fees, gas_limit
         )
-        if result.nonce_consumed:
+        if result.nonce_consumed or cfg.dry_run:
             nonce += 1
         if result.ok:
             success += 1
