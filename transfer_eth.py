@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable ETH Batch Payout Service v5
+Reliable ETH Batch Payout Service v6
 
 Purpose:
 - Send fixed ETH amounts from one treasury wallet to multiple recipients.
@@ -20,7 +20,7 @@ Required environment:
 Optional environment:
   TREASURY_ADDRESS="0x..."          must match PRIVATE_KEY
   RECIPIENTS_FILE="recipients.json"
-  STATE_FILE="payout_state_v5.jsonl"
+  STATE_FILE="payout_state_v6.jsonl"
   LOCK_FILE="payout.lock"
 
   DRY_RUN=false
@@ -159,7 +159,7 @@ class Config:
             private_key=os.getenv("PRIVATE_KEY", "").strip(),
             treasury_address=os.getenv("TREASURY_ADDRESS", "").strip(),
             recipients_file=Path(os.getenv("RECIPIENTS_FILE", "recipients.json")),
-            state_file=Path(os.getenv("STATE_FILE", "payout_state_v5.jsonl")),
+            state_file=Path(os.getenv("STATE_FILE", "payout_state_v6.jsonl")),
             lock_file=Path(os.getenv("LOCK_FILE", "payout.lock")),
             dry_run=env_bool("DRY_RUN", False),
             chain_id_override=env_int("CHAIN_ID", 0, 0),
@@ -220,7 +220,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("eth-batch-v5")
+log = logging.getLogger("eth-batch-v6")
 
 
 # -----------------------------------------------------------------------------
@@ -409,14 +409,18 @@ class ProcessLock:
         else:
             raise RuntimeError(f"Unable to acquire lock: {self.path}")
 
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({
-                "pid": os.getpid(),
-                "host": socket.gethostname(),
-                "started_at": int(time.time()),
-            }) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "started_at": int(time.time()),
+                }) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            self.path.unlink(missing_ok=True)
+            raise
         self.acquired = True
         atexit.register(self.release)
 
@@ -456,9 +460,11 @@ class AuditLog:
                     continue
                 try:
                     item = json.loads(line)
-                except json.JSONDecodeError:
-                    log.warning("Ignoring malformed audit line %s in %s", line_no, self.path)
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Malformed audit log line {line_no} in {self.path}: {exc}. "
+                        "Refusing resume because ignoring state corruption could duplicate a payout."
+                    ) from exc
                 if isinstance(item, dict) and item.get("batch_id") == batch_id:
                     records.append(item)
         return records
@@ -529,7 +535,9 @@ class RPCPool:
         return node
 
     def call(self, name: str, fn: Callable[[Web3], T], retries: Optional[int] = None) -> T:
-        attempts = retries or self.cfg.retry_limit
+        attempts = self.cfg.retry_limit if retries is None else retries
+        if attempts < 1:
+            raise ValueError("RPC call attempts must be >= 1")
         last_exc: Optional[BaseException] = None
         for attempt in range(1, attempts + 1):
             if STOP_REQUESTED:
@@ -538,7 +546,7 @@ class RPCPool:
             try:
                 if node.chain_id is not None and self.expected_chain_id is not None:
                     if node.chain_id != self.expected_chain_id:
-                        raise RuntimeError("RPC chain ID changed")
+                        raise RuntimeError("RPC chain ID mismatch")
                 result = fn(node.w3)
                 node.failures = max(0, node.failures - 1)
                 return result
@@ -842,9 +850,12 @@ def recover_batch_progress(
         event = str(record.get("event", ""))
         status = str(record.get("status", ""))
 
-        # DRY_RUN must never mark a real payout as complete. This fixes the v3
-        # bug where a later real run could skip recipients after a dry run.
-        if event == "dry_run":
+        # DRY_RUN evidence must never participate in real-send recovery.
+        # In particular, a dry run writes a deterministic "prepared" record
+        # before its "dry_run" record; treating that prepared record as
+        # broadcast evidence would make the next real run fail closed forever.
+        if event == "dry_run" or bool(record.get("dry_run", False)):
+            unresolved.pop(idx, None)
             continue
 
         if (event == "receipt" and status == "confirmed") or event == "resume_reconciled_confirmed":
@@ -976,16 +987,19 @@ def wait_for_receipt(rpc: RPCPool, cfg: Config, tx_hash: str) -> str:
 
 
 def tx_is_known(rpc: RPCPool, tx_hash: str) -> bool:
-    def lookup(w3: Web3) -> bool:
+    """Return True if any validated RPC can prove the transaction is known."""
+    for node in rpc.nodes:
         try:
-            w3.eth.get_transaction(tx_hash)
+            node.w3.eth.get_transaction(tx_hash)
             return True
         except TransactionNotFound:
-            return False
-    try:
-        return bool(rpc.call("get_transaction", lookup, retries=1))
-    except Exception:
-        return False
+            continue
+        except Exception as exc:
+            log.warning(
+                "Transaction lookup failed rpc=%s tx=%s error=%s",
+                redact_url(node.url), tx_hash, exc,
+            )
+    return False
 
 
 def reconcile_nonce(rpc: RPCPool, treasury: str, nonce: int, tx_hash: str) -> bool:
