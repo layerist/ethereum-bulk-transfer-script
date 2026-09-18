@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable ETH Batch Payout Service v4
+Reliable ETH Batch Payout Service v5
 
 Purpose:
 - Send fixed ETH amounts from one treasury wallet to multiple recipients.
@@ -20,7 +20,7 @@ Required environment:
 Optional environment:
   TREASURY_ADDRESS="0x..."          must match PRIVATE_KEY
   RECIPIENTS_FILE="recipients.json"
-  STATE_FILE="payout_state_v4.jsonl"
+  STATE_FILE="payout_state_v5.jsonl"
   LOCK_FILE="payout.lock"
 
   DRY_RUN=false
@@ -159,7 +159,7 @@ class Config:
             private_key=os.getenv("PRIVATE_KEY", "").strip(),
             treasury_address=os.getenv("TREASURY_ADDRESS", "").strip(),
             recipients_file=Path(os.getenv("RECIPIENTS_FILE", "recipients.json")),
-            state_file=Path(os.getenv("STATE_FILE", "payout_state_v3.jsonl")),
+            state_file=Path(os.getenv("STATE_FILE", "payout_state_v5.jsonl")),
             lock_file=Path(os.getenv("LOCK_FILE", "payout.lock")),
             dry_run=env_bool("DRY_RUN", False),
             chain_id_override=env_int("CHAIN_ID", 0, 0),
@@ -220,7 +220,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("eth-batch-v3")
+log = logging.getLogger("eth-batch-v5")
 
 
 # -----------------------------------------------------------------------------
@@ -599,6 +599,8 @@ def load_recipients(cfg: Config) -> list[Recipient]:
         if not Web3.is_address(to_raw):
             raise ValueError(f"Recipient #{idx} has invalid address: {to_raw!r}")
         to = Web3.to_checksum_address(to_raw)
+        if int(to, 16) == 0:
+            raise ValueError(f"Recipient #{idx} is the zero address")
         value_wei = eth_to_wei(item["value_eth"])
 
         key = to.lower()
@@ -764,6 +766,10 @@ def _query_tx_state_across_nodes(
     if responsive == 0:
         return "ambiguous", None
 
+    # Absence is much harder to prove than presence. A failed/unreachable RPC
+    # must never help us conclude that a transaction was never broadcast.
+    all_nodes_responsive = responsive == len(rpc.nodes)
+
     if successful_receipt is not None and reverted_receipt is not None:
         # Nodes disagree on canonical-chain state. Never guess.
         return "ambiguous", None
@@ -777,8 +783,11 @@ def _query_tx_state_across_nodes(
     # Safe automatic retry is allowed only when every responsive observation
     # shows that neither pending nor mined nonce has advanced past this nonce.
     if (
-        pending_nonces
+        all_nodes_responsive
+        and pending_nonces
         and latest_nonces
+        and len(pending_nonces) == len(rpc.nodes)
+        and len(latest_nonces) == len(rpc.nodes)
         and max(pending_nonces) <= nonce
         and max(latest_nonces) <= nonce
     ):
@@ -1089,12 +1098,15 @@ def send_one(
                 return SendResult(True, True, tx_hash, receipt_status)
             if receipt_status in {"receipt_timeout", "confirmation_timeout"}:
                 log.warning("[%s] %s for %s", recipient.idx, receipt_status, tx_hash)
-                return SendResult(
-                    cfg.continue_after_receipt_timeout,
-                    True,
-                    tx_hash,
-                    receipt_status,
-                )
+                # A timeout leaves the exact transaction unresolved. Even if the
+                # nonce appears consumed, automatically sending the next payout can
+                # compound ambiguity. Stop and let RESUME reconcile the exact hash.
+                if cfg.continue_after_receipt_timeout:
+                    log.warning(
+                        "CONTINUE_AFTER_RECEIPT_TIMEOUT is ignored for safety; "
+                        "restart with RESUME=true after RPC state converges"
+                    )
+                return SendResult(False, True, tx_hash, receipt_status)
             log.error("[%s] transaction status=%s tx=%s", recipient.idx, receipt_status, tx_hash)
             return SendResult(False, True, tx_hash, receipt_status)
 
@@ -1178,6 +1190,12 @@ def run() -> int:
         )
 
     recipients = load_recipients(cfg)
+    self_payments = [r.idx for r in recipients if r.to.lower() == treasury.lower()]
+    if self_payments:
+        raise ValueError(
+            "Treasury address appears as a recipient at indices "
+            + ", ".join(map(str, self_payments))
+        )
     if not recipients:
         log.warning("No recipients loaded")
         return 0
@@ -1260,6 +1278,13 @@ def run() -> int:
         interrupted=STOP_REQUESTED,
         dry_run=cfg.dry_run,
     )
+    if failed == 0 and not STOP_REQUESTED:
+        audit.write(
+            "batch_complete",
+            success=success,
+            total_recipients=len(recipients),
+            dry_run=cfg.dry_run,
+        )
     log.info("DONE success=%s failed=%s dry_run=%s", success, failed, cfg.dry_run)
     return 0 if failed == 0 and not STOP_REQUESTED else (130 if STOP_REQUESTED else 1)
 
