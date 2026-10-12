@@ -65,6 +65,7 @@ import signal
 import socket
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
@@ -189,6 +190,21 @@ class Config:
         return cfg
 
     def validate(self) -> None:
+        # Validate fixed-point configuration before connecting to a wallet or RPC.
+        for name, value in (
+            ("PRIORITY_FEE_GWEI", self.priority_fee_gwei),
+            ("MAX_PRIORITY_FEE_GWEI", self.max_priority_fee_gwei),
+            ("MAX_FEE_CAP_GWEI", self.max_fee_cap_gwei),
+        ):
+            try:
+                gwei_to_wei(value)
+            except (ValueError, InvalidOperation) as exc:
+                raise ValueError(f"{name} must be specified in whole wei") from exc
+        if self.max_total_eth:
+            try:
+                decimal_to_wei(self.max_total_eth, WEI_PER_ETH)
+            except (ValueError, InvalidOperation) as exc:
+                raise ValueError("MAX_TOTAL_ETH must be specified in whole wei") from exc
         if not self.rpc_urls:
             raise ValueError("RPC_URLS is missing")
         if not self.private_key:
@@ -271,13 +287,21 @@ def gwei_to_wei(value: Decimal) -> int:
     return decimal_to_wei(value, WEI_PER_GWEI)
 
 
+def _format_base_units(value: int, decimals: int) -> str:
+    """Convert integer base units without rounding large balances."""
+    sign = "-" if value < 0 else ""
+    whole, fractional = divmod(abs(value), 10 ** decimals)
+    if not fractional:
+        return f"{sign}{whole}"
+    return f"{sign}{whole}.{fractional:0{decimals}d}".rstrip("0")
+
+
 def wei_to_eth_str(value: int) -> str:
-    text = f"{Decimal(value) / WEI_PER_ETH:.18f}".rstrip("0").rstrip(".")
-    return f"{text} ETH"
+    return f"{_format_base_units(value, 18)} ETH"
 
 
 def wei_to_gwei_str(value: int) -> str:
-    return f"{Decimal(value) / WEI_PER_GWEI:f}".rstrip("0").rstrip(".")
+    return _format_base_units(value, 9)
 
 
 def short_addr(address: str) -> str:
@@ -347,6 +371,7 @@ class ProcessLock:
         self.path = path
         self.stale_after_seconds = stale_after_seconds
         self.acquired = False
+        self.token = uuid.uuid4().hex
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
@@ -373,9 +398,12 @@ class ProcessLock:
         if not self.path.exists():
             return True
         info = self._read_existing()
-        pid = int(info.get("pid", 0) or 0)
+        try:
+            pid = int(info.get("pid", 0) or 0)
+            started_at = int(info.get("started_at", 0) or 0)
+        except (TypeError, ValueError):
+            return False
         host = str(info.get("host", ""))
-        started_at = int(info.get("started_at", 0) or 0)
         age = max(0, int(time.time()) - started_at) if started_at else None
         same_host = not host or host == socket.gethostname()
         dead_local_process = same_host and pid > 0 and not self._pid_is_alive(pid)
@@ -385,6 +413,9 @@ class ProcessLock:
             and age >= self.stale_after_seconds
         )
         if dead_local_process and old_enough:
+            # Do not delete a replacement lock if it changed during inspection.
+            if self._read_existing() != info:
+                return False
             log.warning(
                 "Removing stale lock %s pid=%s age=%ss", self.path, pid, age
             )
@@ -415,6 +446,7 @@ class ProcessLock:
                     "pid": os.getpid(),
                     "host": socket.gethostname(),
                     "started_at": int(time.time()),
+                    "token": self.token,
                 }) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -427,7 +459,10 @@ class ProcessLock:
     def release(self) -> None:
         if self.acquired:
             try:
-                self.path.unlink(missing_ok=True)
+                # A lock may have been manually removed and recreated while
+                # we were running; never release another process's lock.
+                if self._read_existing().get("token") == self.token:
+                    self.path.unlink(missing_ok=True)
             finally:
                 self.acquired = False
 
@@ -528,7 +563,17 @@ class RPCPool:
         now = time.monotonic()
         candidates = [n for n in self.nodes if n.cooldown_until <= now]
         if not candidates:
-            candidates = self.nodes
+            # With a single RPC, ignoring cooldown would hammer a rate-limited
+            # endpoint on each retry. Respect it even when all nodes failed.
+            earliest = min(n.cooldown_until for n in self.nodes)
+            delay = max(0.0, earliest - now)
+            if delay:
+                time.sleep(delay)
+            if STOP_REQUESTED:
+                raise StopRequested("Stop requested")
+            candidates = [n for n in self.nodes if n.cooldown_until <= time.monotonic()]
+            if not candidates:
+                candidates = [min(self.nodes, key=lambda n: n.cooldown_until)]
         candidates.sort(key=lambda n: (n.failures, n.cooldown_until))
         node = candidates[self.cursor % len(candidates)]
         self.cursor += 1
@@ -831,6 +876,8 @@ def recover_batch_progress(
     valid_indices = {r.idx for r in recipients}
     confirmed: set[int] = set()
     unresolved: dict[int, dict[str, Any]] = {}
+    seen_evidence: dict[int, tuple[str, int]] = {}
+    inconsistent_evidence: set[int] = set()
 
     broadcastish_events = {
         "prepared",
@@ -850,13 +897,27 @@ def recover_batch_progress(
         event = str(record.get("event", ""))
         status = str(record.get("status", ""))
 
-        # DRY_RUN evidence must never participate in real-send recovery.
-        # In particular, a dry run writes a deterministic "prepared" record
-        # before its "dry_run" record; treating that prepared record as
-        # broadcast evidence would make the next real run fail closed forever.
+        # Dry-run events must not create OR erase real-send evidence. Erasing
+        # earlier unresolved state here could cause a duplicate payment after
+        # a later dry-run executed with RESUME=false.
         if event == "dry_run" or bool(record.get("dry_run", False)):
-            unresolved.pop(idx, None)
             continue
+
+        if event in broadcastish_events or event in {"receipt", "resume_reconciled_confirmed"}:
+            tx_hash = record.get("tx_hash")
+            nonce = record.get("nonce")
+            if (
+                not isinstance(tx_hash, str) or not tx_hash
+                or type(nonce) is not int or nonce < 0
+            ):
+                inconsistent_evidence.add(idx)
+            else:
+                earlier = seen_evidence.setdefault(idx, (tx_hash.lower(), nonce))
+                if earlier[0] != tx_hash.lower() and earlier[1] != nonce:
+                    # Two different signed transactions using different
+                    # nonces can both pay the recipient. Do not silently
+                    # forget one after a restart with RESUME=false.
+                    inconsistent_evidence.add(idx)
 
         if (event == "receipt" and status == "confirmed") or event == "resume_reconciled_confirmed":
             confirmed.add(idx)
@@ -872,6 +933,13 @@ def recover_batch_progress(
             merged = dict(previous)
             merged.update(record)
             unresolved[idx] = merged
+
+    if inconsistent_evidence:
+        raise RuntimeError(
+            "Conflicting or incomplete audit transaction evidence for recipients "
+            + ", ".join(f"#{idx}" for idx in sorted(inconsistent_evidence))
+            + ". Refusing automatic retry to prevent duplicate payouts."
+        )
 
     ambiguous: list[str] = []
 
@@ -950,6 +1018,7 @@ def get_receipt_once(rpc: RPCPool, tx_hash: str) -> Optional[Any]:
             return w3.eth.get_transaction_receipt(tx_hash)
         except TransactionNotFound:
             return None
+
     return rpc.call("get_transaction_receipt", fetch)
 
 
@@ -979,6 +1048,13 @@ def wait_for_receipt(rpc: RPCPool, cfg: Config, tx_hash: str) -> str:
                         return "reorged"
                     if int(final_receipt.get("status", 0)) != 1:
                         return "reverted"
+                    # A reorg can reinclude the transaction in a different,
+                    # newer block; its new inclusion must also mature.
+                    if (
+                        int(final_receipt["blockNumber"]) != block_number
+                        or final_receipt.get("blockHash") != receipt.get("blockHash")
+                    ):
+                        return "reorged"
                     return "confirmed"
                 time.sleep(cfg.receipt_poll_interval)
             return "confirmation_timeout"
@@ -1049,6 +1125,39 @@ def build_signed_transaction(
     return tx, raw_bytes, tx_hash
 
 
+def _finish_send(
+    rpc: RPCPool,
+    cfg: Config,
+    audit: AuditLog,
+    recipient: Recipient,
+    nonce: int,
+    tx_hash: str,
+    source: str,
+) -> SendResult:
+    """Handle an accepted transaction without accidentally rebroadcasting on lookup errors."""
+    if not cfg.wait_receipts:
+        return SendResult(True, True, tx_hash, source)
+
+    try:
+        status = wait_for_receipt(rpc, cfg, tx_hash)
+    except Exception as exc:
+        # The prepared/sent evidence has already been durably written. A
+        # receipt RPC failure does not imply that sending failed.
+        log.error("[%s] receipt lookup failed for %s: %s", recipient.idx, tx_hash, exc)
+        status = "receipt_lookup_error"
+    audit.write("receipt", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash, status=status)
+    if status in {"receipt_timeout", "confirmation_timeout"}:
+        log.warning("[%s] %s for %s", recipient.idx, status, tx_hash)
+        if cfg.continue_after_receipt_timeout:
+            log.warning(
+                "CONTINUE_AFTER_RECEIPT_TIMEOUT is ignored for safety; "
+                "restart with RESUME=true after RPC state converges"
+            )
+    elif status != "confirmed":
+        log.error("[%s] transaction status=%s tx=%s", recipient.idx, status, tx_hash)
+    return SendResult(status == "confirmed", True, tx_hash, status)
+
+
 def send_one(
     rpc: RPCPool,
     cfg: Config,
@@ -1060,7 +1169,7 @@ def send_one(
     fees: FeeParams,
     gas_limit: int,
 ) -> SendResult:
-    tx, raw_tx, tx_hash = build_signed_transaction(
+    _tx, raw_tx, tx_hash = build_signed_transaction(
         cfg.private_key, treasury, recipient, nonce, chain_id, fees, gas_limit
     )
     audit.write(
@@ -1083,8 +1192,7 @@ def send_one(
             recipient.idx, short_addr(recipient.to), wei_to_eth_str(recipient.value_wei),
             nonce, gas_limit, tx_hash,
         )
-        audit.write("dry_run", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash)
-        # No chain nonce is consumed in dry-run mode.
+        audit.write("dry_run", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash, dry_run=True)
         return SendResult(True, False, tx_hash, "dry_run")
 
     last_error: Optional[BaseException] = None
@@ -1093,46 +1201,11 @@ def send_one(
             return SendResult(False, False, tx_hash, "interrupted_before_send")
         try:
             returned_hash = rpc.send_raw(raw_tx)
-            if returned_hash.lower() != tx_hash.lower():
-                raise RuntimeError(
-                    f"RPC returned unexpected tx hash {returned_hash}; locally signed hash is {tx_hash}"
-                )
-            log.info(
-                "[%s] sent %s -> %s amount=%s nonce=%s",
-                recipient.idx, tx_hash, short_addr(recipient.to),
-                wei_to_eth_str(recipient.value_wei), nonce,
-            )
-            audit.write("sent", idx=recipient.idx, to=recipient.to, nonce=nonce, tx_hash=tx_hash)
-            if not cfg.wait_receipts:
-                return SendResult(True, True, tx_hash, "broadcast")
-
-            receipt_status = wait_for_receipt(rpc, cfg, tx_hash)
-            audit.write("receipt", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash, status=receipt_status)
-            if receipt_status == "confirmed":
-                return SendResult(True, True, tx_hash, receipt_status)
-            if receipt_status in {"receipt_timeout", "confirmation_timeout"}:
-                log.warning("[%s] %s for %s", recipient.idx, receipt_status, tx_hash)
-                # A timeout leaves the exact transaction unresolved. Even if the
-                # nonce appears consumed, automatically sending the next payout can
-                # compound ambiguity. Stop and let RESUME reconcile the exact hash.
-                if cfg.continue_after_receipt_timeout:
-                    log.warning(
-                        "CONTINUE_AFTER_RECEIPT_TIMEOUT is ignored for safety; "
-                        "restart with RESUME=true after RPC state converges"
-                    )
-                return SendResult(False, True, tx_hash, receipt_status)
-            log.error("[%s] transaction status=%s tx=%s", recipient.idx, receipt_status, tx_hash)
-            return SendResult(False, True, tx_hash, receipt_status)
-
         except Exception as exc:
             last_error = exc
             if is_already_known(exc):
                 audit.write("already_known", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash)
-                if not cfg.wait_receipts:
-                    return SendResult(True, True, tx_hash, "already_known")
-                status = wait_for_receipt(rpc, cfg, tx_hash)
-                audit.write("receipt", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash, status=status)
-                return SendResult(status == "confirmed", True, tx_hash, status)
+                return _finish_send(rpc, cfg, audit, recipient, nonce, tx_hash, "already_known")
 
             if is_nonce_too_low(exc) or is_replacement_underpriced(exc):
                 consumed = reconcile_nonce(rpc, treasury, nonce, tx_hash)
@@ -1155,15 +1228,30 @@ def send_one(
                 recipient.idx, attempt, cfg.retry_limit, exc,
             )
             if attempt < cfg.retry_limit:
-                # Before rebroadcasting, verify whether the previous call actually succeeded.
                 if tx_is_known(rpc, tx_hash):
                     audit.write("found_after_send_error", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash)
-                    if not cfg.wait_receipts:
-                        return SendResult(True, True, tx_hash, "found_after_send_error")
-                    status = wait_for_receipt(rpc, cfg, tx_hash)
-                    audit.write("receipt", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash, status=status)
-                    return SendResult(status == "confirmed", True, tx_hash, status)
+                    return _finish_send(
+                        rpc, cfg, audit, recipient, nonce, tx_hash, "found_after_send_error"
+                    )
                 time.sleep(min(0.5 * (2 ** (attempt - 1)) + random.random() * 0.5, 8.0))
+            continue
+
+        if returned_hash.lower() != tx_hash.lower():
+            # The remote node may have broadcast *something*; fail closed.
+            audit.write(
+                "send_unknown", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash,
+                returned_hash=returned_hash, error="unexpected transaction hash",
+            )
+            log.error("[%s] RPC returned unexpected transaction hash; stopping", recipient.idx)
+            return SendResult(False, False, tx_hash, "unexpected_tx_hash")
+
+        log.info(
+            "[%s] sent %s -> %s amount=%s nonce=%s",
+            recipient.idx, tx_hash, short_addr(recipient.to),
+            wei_to_eth_str(recipient.value_wei), nonce,
+        )
+        audit.write("sent", idx=recipient.idx, to=recipient.to, nonce=nonce, tx_hash=tx_hash)
+        return _finish_send(rpc, cfg, audit, recipient, nonce, tx_hash, "broadcast")
 
     known = tx_is_known(rpc, tx_hash)
     consumed = known or reconcile_nonce(rpc, treasury, nonce, tx_hash)
