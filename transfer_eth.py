@@ -48,7 +48,8 @@ Optional environment:
   MAX_TOTAL_ETH=0                     0 = disabled
   CONTINUE_AFTER_RECEIPT_TIMEOUT=false
   RESUME=true                         skip recipients already confirmed in this exact batch
-                                      and reconcile crash-window prepared transactions on-chain
+                                      and reconcile crash-window prepared transactions on-chain;
+                                      retry only at the original prepared nonce
   STALE_LOCK_SECONDS=300            remove dead local lock after this age; 0 = never
   LOG_LEVEL=INFO
 """
@@ -63,7 +64,6 @@ import os
 import random
 import signal
 import socket
-import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -227,8 +227,12 @@ class Config:
 
         for url in self.rpc_urls:
             parsed = urlsplit(url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError(f"Invalid RPC URL: {redact_url(url)}")
+            try:
+                parsed.port  # Validate the optional port, if present.
+            except ValueError as exc:
+                raise ValueError(f"Invalid RPC URL: {redact_url(url)}") from exc
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -267,10 +271,38 @@ class SendResult:
 
 
 def decimal_to_wei(value: Decimal, unit: Decimal) -> int:
-    result = value * unit
-    if result != result.to_integral_value():
-        raise ValueError(f"Value has too many decimal places: {value}")
-    return int(result)
+    """Convert amounts exactly, independent of the active Decimal precision."""
+    if not value.is_finite():
+        raise ValueError("Amount must be finite")
+    if unit == WEI_PER_ETH:
+        unit_decimals = 18
+    elif unit == WEI_PER_GWEI:
+        unit_decimals = 9
+    else:
+        raise ValueError("Unsupported base unit")
+
+    sign, digits, exponent = value.as_tuple()
+    # Ethereum uint256 values cannot represent arbitrarily large amounts.
+    # Check the exponent *before* constructing any potentially huge integer.
+    if value and value.adjusted() + unit_decimals > 77:
+        raise ValueError(f"Amount exceeds uint256 wei range: {value}")
+    coefficient = int("".join(map(str, digits)))
+    if coefficient == 0:
+        return 0
+    scaled_exponent = exponent + unit_decimals
+    if scaled_exponent >= 0:
+        result = coefficient * 10 ** scaled_exponent
+    elif -scaled_exponent >= len(digits) + 1:
+        if coefficient:
+            raise ValueError(f"Value has too many decimal places: {value}")
+        result = 0
+    else:
+        result, remainder = divmod(coefficient, 10 ** -scaled_exponent)
+        if remainder:
+            raise ValueError(f"Value has too many decimal places: {value}")
+    if result > 2**256 - 1:
+        raise ValueError(f"Amount exceeds uint256 wei range: {value}")
+    return -result if sign else result
 
 
 def eth_to_wei(value: Any) -> int:
@@ -479,7 +511,9 @@ class AuditLog:
     def write(self, event: str, **fields: Any) -> None:
         record = {"ts": int(time.time()), **self.context, "event": event, **fields}
         line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        with self.path.open("a", encoding="utf-8") as handle:
+        # New audit files contain payment metadata and must not be world-readable.
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -788,8 +822,6 @@ def _query_tx_state_across_nodes(
 
     for node in rpc.nodes:
         try:
-            responsive += 1
-
             try:
                 receipt = node.w3.eth.get_transaction_receipt(tx_hash)
             except TransactionNotFound:
@@ -810,6 +842,7 @@ def _query_tx_state_across_nodes(
 
             pending_nonces.append(int(node.w3.eth.get_transaction_count(treasury, "pending")))
             latest_nonces.append(int(node.w3.eth.get_transaction_count(treasury, "latest")))
+            responsive += 1
         except Exception as exc:
             log.warning(
                 "Resume reconciliation RPC failed rpc=%s tx=%s error=%s",
@@ -849,6 +882,12 @@ def _query_tx_state_across_nodes(
     return "ambiguous", None
 
 
+@dataclass
+class RecoveryState:
+    confirmed: set[int]
+    safe_retry_nonces: dict[int, int]
+
+
 def recover_batch_progress(
     audit: AuditLog,
     batch_id: str,
@@ -857,7 +896,7 @@ def recover_batch_progress(
     rpc: RPCPool,
     treasury: str,
     cfg: Config,
-) -> set[int]:
+) -> RecoveryState:
     """
     Recover only payouts proven complete.
 
@@ -867,16 +906,17 @@ def recover_batch_progress(
     before the "sent" audit record was fsynced.
     """
     if not resume:
-        return set()
+        return RecoveryState(set(), {})
 
     records = audit.records_for_batch(batch_id)
     if not records:
-        return set()
+        return RecoveryState(set(), {})
 
     valid_indices = {r.idx for r in recipients}
     confirmed: set[int] = set()
     unresolved: dict[int, dict[str, Any]] = {}
     seen_evidence: dict[int, tuple[str, int]] = {}
+    safe_retry_nonces: dict[int, int] = {}
     inconsistent_evidence: set[int] = set()
 
     broadcastish_events = {
@@ -891,7 +931,7 @@ def recover_batch_progress(
 
     for record in records:
         idx = record.get("idx")
-        if not isinstance(idx, int) or idx not in valid_indices:
+        if type(idx) is not int or idx not in valid_indices:
             continue
 
         event = str(record.get("event", ""))
@@ -913,10 +953,10 @@ def recover_batch_progress(
                 inconsistent_evidence.add(idx)
             else:
                 earlier = seen_evidence.setdefault(idx, (tx_hash.lower(), nonce))
-                if earlier[0] != tx_hash.lower() and earlier[1] != nonce:
-                    # Two different signed transactions using different
-                    # nonces can both pay the recipient. Do not silently
-                    # forget one after a restart with RESUME=false.
+                if earlier[1] != nonce:
+                    # Different nonces can both pay the recipient, even if
+                    # hashes in a corrupted audit log happen to match.
+                    # Never silently forget one after RESUME=false.
                     inconsistent_evidence.add(idx)
 
         if (event == "receipt" and status == "confirmed") or event == "resume_reconciled_confirmed":
@@ -924,6 +964,9 @@ def recover_batch_progress(
             unresolved.pop(idx, None)
             continue
 
+        # A completed payout does not make later send evidence disappear.
+        # For example, RESUME=false can start another payout with a different
+        # nonce; this must remain visible to the conflict check above.
         if idx in confirmed:
             continue
 
@@ -989,8 +1032,11 @@ def recover_batch_progress(
                 nonce=nonce,
                 tx_hash=tx_hash,
             )
+            # Retrying at a *new* nonce would risk paying twice if the
+            # original transaction later propagates. Pin the old nonce.
+            safe_retry_nonces[idx] = nonce
             log.warning(
-                "Recovered recipient #%s as safe-to-retry; tx not known and nonce=%s is still free",
+                "Recovered recipient #%s as safe-to-retry ONLY at original nonce=%s",
                 idx, nonce,
             )
             continue
@@ -1005,7 +1051,7 @@ def recover_batch_progress(
               "Resolve these transactions on-chain before continuing."
         )
 
-    return confirmed
+    return RecoveryState(confirmed, safe_retry_nonces)
 
 
 # -----------------------------------------------------------------------------
@@ -1022,6 +1068,13 @@ def get_receipt_once(rpc: RPCPool, tx_hash: str) -> Optional[Any]:
     return rpc.call("get_transaction_receipt", fetch)
 
 
+def receipt_is_canonical(rpc: RPCPool, receipt: Any) -> bool:
+    """Confirm that the receipt's inclusion block is still canonical."""
+    block_number = int(receipt["blockNumber"])
+    block = rpc.call("receipt_canonical_block", lambda w3: w3.eth.get_block(block_number))
+    return block["hash"] == receipt["blockHash"]
+
+
 def wait_for_receipt(rpc: RPCPool, cfg: Config, tx_hash: str) -> str:
     deadline = time.monotonic() + cfg.receipt_timeout
     while time.monotonic() < deadline:
@@ -1033,6 +1086,8 @@ def wait_for_receipt(rpc: RPCPool, cfg: Config, tx_hash: str) -> str:
             if status != 1:
                 return "reverted"
             block_number = int(receipt["blockNumber"])
+            if not receipt_is_canonical(rpc, receipt):
+                return "reorged"
             if cfg.confirmations <= 1:
                 return "confirmed"
 
@@ -1053,6 +1108,7 @@ def wait_for_receipt(rpc: RPCPool, cfg: Config, tx_hash: str) -> str:
                     if (
                         int(final_receipt["blockNumber"]) != block_number
                         or final_receipt.get("blockHash") != receipt.get("blockHash")
+                        or not receipt_is_canonical(rpc, final_receipt)
                     ):
                         return "reorged"
                     return "confirmed"
@@ -1094,6 +1150,31 @@ def reconcile_nonce(rpc: RPCPool, treasury: str, nonce: int, tx_hash: str) -> bo
     except Exception:
         return False
     return pending_nonce > nonce or latest_nonce > nonce
+
+
+def observed_pending_nonce(rpc: RPCPool, treasury: str) -> int:
+    """Use the highest observed pending nonce to avoid replacing known transfers.
+
+    An unavailable node cannot establish that a nonce is free, so fail closed.
+    """
+    pending: list[int] = []
+    for node in rpc.nodes:
+        try:
+            latest = int(node.w3.eth.get_transaction_count(treasury, "latest"))
+            candidate = int(node.w3.eth.get_transaction_count(treasury, "pending"))
+            if candidate < latest:
+                raise RuntimeError("pending nonce is below mined nonce")
+            pending.append(candidate)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to verify nonce at RPC {redact_url(node.url)}; "
+                "refusing to risk nonce replacement"
+            ) from exc
+    if not pending:
+        raise RuntimeError("No RPC nodes available to verify nonce")
+    if len(set(pending)) > 1:
+        log.warning("RPC pending nonce observations differ: %s; using highest", pending)
+    return max(pending)
 
 
 def build_signed_transaction(
@@ -1306,7 +1387,8 @@ def run() -> int:
     chain_id = rpc.validate_nodes()
     batch_id = make_batch_id(chain_id, treasury, recipients)
     audit.set_context(batch_id=batch_id, chain_id=chain_id, treasury=treasury)
-    completed_indices = recover_batch_progress(audit, batch_id, recipients, cfg.resume, rpc, treasury, cfg)
+    recovery = recover_batch_progress(audit, batch_id, recipients, cfg.resume, rpc, treasury, cfg)
+    completed_indices = recovery.confirmed
     pending_recipients = [r for r in recipients if r.idx not in completed_indices]
     if completed_indices:
         log.info("Resuming batch %s: already confirmed=%s", batch_id[:12], len(completed_indices))
@@ -1316,10 +1398,7 @@ def run() -> int:
         return 0
     fees, pending_gas_limits = preflight(rpc, cfg, treasury, pending_recipients)
     gas_by_idx = {r.idx: gas for r, gas in zip(pending_recipients, pending_gas_limits)}
-    nonce = int(rpc.call(
-        "get_pending_nonce",
-        lambda w3: w3.eth.get_transaction_count(treasury, "pending"),
-    ))
+    nonce = observed_pending_nonce(rpc, treasury)
 
     audit.write(
         "batch_start",
@@ -1339,6 +1418,21 @@ def run() -> int:
         if STOP_REQUESTED:
             audit.write("batch_interrupted", next_idx=recipient.idx, nonce=nonce)
             return 130
+
+        pinned_nonce = recovery.safe_retry_nonces.get(recipient.idx)
+        if pinned_nonce is not None and nonce != pinned_nonce:
+            raise RuntimeError(
+                f"Unsafe retry for recipient #{recipient.idx}: original nonce={pinned_nonce}, "
+                f"current nonce={nonce}. A different nonce could duplicate the payment."
+            )
+        if not cfg.dry_run:
+            network_nonce = observed_pending_nonce(rpc, treasury)
+            if network_nonce > nonce:
+                raise RuntimeError(
+                    f"Pending nonce advanced unexpectedly before recipient #{recipient.idx}: "
+                    f"expected={nonce}, observed={network_nonce}. "
+                    "Refusing to replace another pending transaction."
+                )
 
         if cfg.refresh_fees_every and position > 1 and (position - 1) % cfg.refresh_fees_every == 0:
             fees = get_fee_params(rpc, cfg)
