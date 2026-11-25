@@ -21,7 +21,7 @@ Optional environment:
   TREASURY_ADDRESS="0x..."          must match PRIVATE_KEY
   RECIPIENTS_FILE="recipients.json"
   STATE_FILE="payout_state_v6.jsonl"
-  LOCK_FILE="payout.lock"
+  LOCK_FILE="payout.lock"              persistent .guard sidecar; do not delete while running
 
   DRY_RUN=false
   CHAIN_ID=0                          0 = auto-detect
@@ -37,7 +37,7 @@ Optional environment:
   MIN_GAS_LIMIT=21000
   REFRESH_FEES_EVERY=10               transactions; 0 = never
 
-  WAIT_RECEIPTS=true
+  WAIT_RECEIPTS=true                  false = broadcast only, not confirmed
   RECEIPT_TIMEOUT=180
   RECEIPT_POLL_INTERVAL=3
   CONFIRMATIONS=1
@@ -46,10 +46,11 @@ Optional environment:
   ALLOW_DUPLICATE_RECIPIENTS=false
   MAX_RECIPIENTS=10000
   MAX_TOTAL_ETH=0                     0 = disabled
-  CONTINUE_AFTER_RECEIPT_TIMEOUT=false
+  CONTINUE_AFTER_RECEIPT_TIMEOUT=false  legacy option; ignored for safety
   RESUME=true                         skip recipients already confirmed in this exact batch
                                       and reconcile crash-window prepared transactions on-chain;
-                                      retry only at the original prepared nonce
+                                      retry only at the original prepared nonce;
+                                      false intentionally bypasses duplicate protection
   STALE_LOCK_SECONDS=300            remove dead local lock after this age; 0 = never
   LOG_LEVEL=INFO
 """
@@ -60,14 +61,16 @@ import atexit
 import hashlib
 import json
 import logging
+import math
+import re
 import os
 import random
 import signal
 import socket
 import time
 import uuid
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence, TypeVar
 from urllib.parse import urlsplit, urlunsplit
@@ -122,8 +125,8 @@ def env_decimal(name: str, default: str, minimum: Optional[Decimal] = None) -> D
 
 @dataclass(frozen=True)
 class Config:
-    rpc_urls: tuple[str, ...]
-    private_key: str
+    rpc_urls: tuple[str, ...] = field(repr=False)
+    private_key: str = field(repr=False)
     treasury_address: str
     recipients_file: Path
     state_file: Path
@@ -154,7 +157,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        urls = tuple(x.strip() for x in os.getenv("RPC_URLS", "").split(",") if x.strip())
+        urls = tuple(dict.fromkeys(x.strip() for x in os.getenv("RPC_URLS", "").split(",") if x.strip()))
         cfg = cls(
             rpc_urls=urls,
             private_key=os.getenv("PRIVATE_KEY", "").strip(),
@@ -190,6 +193,10 @@ class Config:
         return cfg
 
     def validate(self) -> None:
+        for name, value in (("RPC_COOLDOWN_SECONDS", self.rpc_cooldown_seconds),
+                            ("RECEIPT_POLL_INTERVAL", self.receipt_poll_interval)):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         # Validate fixed-point configuration before connecting to a wallet or RPC.
         for name, value in (
             ("PRIORITY_FEE_GWEI", self.priority_fee_gwei),
@@ -219,11 +226,17 @@ class Config:
             "RECIPIENTS_FILE": self.recipients_file.resolve(),
             "STATE_FILE": self.state_file.resolve(),
             "LOCK_FILE": self.lock_file.resolve(),
+            "LOCK_GUARD": lock_guard_path(self.lock_file).resolve(),
         }
         if len(set(resolved.values())) != len(resolved):
             raise ValueError(
-                "RECIPIENTS_FILE, STATE_FILE and LOCK_FILE must all point to different files"
+                "Recipient, state, lock and lock guard paths must all be distinct"
             )
+
+        existing = [path for path in resolved.values() if path.exists()]
+        for i, path in enumerate(existing):
+            if any(path.samefile(other) for other in existing[:i]):
+                raise ValueError("Recipient, state, lock and lock guard files must not be hard links to each other")
 
         for url in self.rpc_urls:
             parsed = urlsplit(url)
@@ -281,25 +294,19 @@ def decimal_to_wei(value: Decimal, unit: Decimal) -> int:
     else:
         raise ValueError("Unsupported base unit")
 
-    sign, digits, exponent = value.as_tuple()
-    # Ethereum uint256 values cannot represent arbitrarily large amounts.
-    # Check the exponent *before* constructing any potentially huge integer.
-    if value and value.adjusted() + unit_decimals > 77:
-        raise ValueError(f"Amount exceeds uint256 wei range: {value}")
-    coefficient = int("".join(map(str, digits)))
-    if coefficient == 0:
+    if not value:
         return 0
+    sign, digits, exponent = value.as_tuple()
     scaled_exponent = exponent + unit_decimals
-    if scaled_exponent >= 0:
-        result = coefficient * 10 ** scaled_exponent
-    elif -scaled_exponent >= len(digits) + 1:
-        if coefficient:
+    if scaled_exponent < 0:
+        remove = -scaled_exponent
+        if remove >= len(digits) or any(digits[-remove:]):
             raise ValueError(f"Value has too many decimal places: {value}")
-        result = 0
-    else:
-        result, remainder = divmod(coefficient, 10 ** -scaled_exponent)
-        if remainder:
-            raise ValueError(f"Value has too many decimal places: {value}")
+        digits = digits[:-remove]
+        scaled_exponent = 0
+    if len(digits) + scaled_exponent > 78:
+        raise ValueError(f"Amount exceeds uint256 wei range: {value}")
+    result = int("".join(map(str, digits))) * 10 ** scaled_exponent
     if result > 2**256 - 1:
         raise ValueError(f"Amount exceeds uint256 wei range: {value}")
     return -result if sign else result
@@ -348,15 +355,51 @@ def redact_url(url: str) -> str:
             host += f":{p.port}"
         if p.username or p.password:
             host = f"***@{host}"
-        path = p.path
-        # API keys are frequently stored in the final path segment.
-        if len(path.rstrip("/").split("/")[-1]) >= 20:
-            segments = path.split("/")
-            segments[-1] = "***"
-            path = "/".join(segments)
-        return urlunsplit((p.scheme, host, path, "***" if p.query else "", ""))
+        if ":" in (p.hostname or ""):
+            host = f"[{p.hostname}]" + (f":{p.port}" if p.port else "")
+            if p.username or p.password:
+                host = f"***@{host}"
+        return urlunsplit((p.scheme, host, "/***" if p.path not in {"", "/"} else p.path,
+                           "***" if p.query else "", ""))
     except Exception:
         return "<redacted-rpc-url>"
+
+
+def safe_error(exc: BaseException) -> str:
+    """Avoid exposing configured RPC URLs and signing keys in logs or state."""
+    message = str(exc)
+    for url in os.getenv("RPC_URLS", "").split(","):
+        url = url.strip()
+        if url:
+            message = message.replace(url, redact_url(url))
+            try:
+                parsed = urlsplit(url)
+                secrets = [parsed.username, parsed.password, parsed.query]
+                secrets.extend(part for part in parsed.path.split("/") if len(part) >= 12)
+                for secret in secrets:
+                    if secret and len(secret) >= 4:
+                        message = message.replace(secret, "***")
+            except ValueError:
+                pass
+    key = os.getenv("PRIVATE_KEY", "").strip()
+    if key:
+        message = message.replace(key, "***")
+        if key.lower().startswith("0x"):
+            message = message.replace(key[2:], "***")
+    return message
+
+
+def normalize_tx_hash(value: Any) -> str:
+    """Accept both HexBytes conventions and legacy unprefixed audit hashes."""
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).hex()
+    if not isinstance(value, str):
+        raise ValueError("Transaction hash must be bytes or a hex string")
+    if value[:2].lower() == "0x":
+        value = value[2:]
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raise ValueError("Invalid 32-byte transaction hash")
+    return "0x" + value.lower()
 
 
 def error_text(exc: BaseException) -> str:
@@ -365,10 +408,10 @@ def error_text(exc: BaseException) -> str:
 
 def is_already_known(exc: BaseException) -> bool:
     text = error_text(exc)
-    return any(x in text for x in (
-        "already known", "already imported", "known transaction",
-        "transaction already in mempool",
-    ))
+    return bool(re.search(
+        r"\b(?:already known|already imported|known transaction|transaction already in mempool)\b",
+        text,
+    )) and not re.search(r"\b(?:not (?:a )?known transaction|not already known)\b", text)
 
 
 def is_nonce_too_low(exc: BaseException) -> bool:
@@ -379,6 +422,17 @@ def is_nonce_too_low(exc: BaseException) -> bool:
 def is_replacement_underpriced(exc: BaseException) -> bool:
     text = error_text(exc)
     return "replacement transaction underpriced" in text or "replacement fee too low" in text
+
+
+def sleep_interruptibly(seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while True:
+        if STOP_REQUESTED:
+            raise StopRequested("Stop requested")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.25))
 
 
 class StopRequested(RuntimeError):
@@ -398,17 +452,51 @@ def request_stop(signum: int, _frame: Any) -> None:
 # Single-process lock and audit log
 # -----------------------------------------------------------------------------
 
+def lock_guard_path(path: Path) -> Path:
+    path = path.resolve()
+    return path.with_name(path.name + ".guard")
+
+
+def fsync_directory(path: Path) -> None:
+    """Persist directory entries on POSIX before broadcasting any transaction."""
+    if os.name == "nt":
+        return  # Python does not expose portable directory fsync on Windows.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class ProcessLock:
     def __init__(self, path: Path, stale_after_seconds: int):
         self.path = path
         self.stale_after_seconds = stale_after_seconds
         self.acquired = False
         self.token = uuid.uuid4().hex
+        self.guard_fd: Optional[int] = None
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
         if pid <= 0:
             return False
+        if os.name == "nt":
+            # os.kill(pid, 0) is not a safe existence check on Windows.
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if not handle:
+                return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER
+            try:
+                return kernel.WaitForSingleObject(handle, 0) != 0  # WAIT_OBJECT_0
+            finally:
+                kernel.CloseHandle(handle)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -416,7 +504,7 @@ class ProcessLock:
         except PermissionError:
             return True
         except OSError:
-            return False
+            return True  # Unknown liveness: do not reclaim the lock.
         return True
 
     def _read_existing(self) -> dict[str, Any]:
@@ -437,7 +525,7 @@ class ProcessLock:
             return False
         host = str(info.get("host", ""))
         age = max(0, int(time.time()) - started_at) if started_at else None
-        same_host = not host or host == socket.gethostname()
+        same_host = bool(host) and host == socket.gethostname()
         dead_local_process = same_host and pid > 0 and not self._pid_is_alive(pid)
         old_enough = (
             self.stale_after_seconds > 0
@@ -455,8 +543,33 @@ class ProcessLock:
             return True
         return False
 
+    def _acquire_guard(self) -> None:
+        guard = lock_guard_path(self.path)
+        fd = os.open(guard, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                # Windows byte-range locks may extend beyond EOF.
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.guard_fd = fd
+
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._acquire_guard()
+        try:
+            self._acquire_lock_file()
+        except BaseException:
+            self.release()
+            raise
+
+    def _acquire_lock_file(self) -> None:
         for attempt in range(2):
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -482,21 +595,25 @@ class ProcessLock:
                 }) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-        except Exception:
+        except BaseException:
             self.path.unlink(missing_ok=True)
             raise
         self.acquired = True
         atexit.register(self.release)
 
     def release(self) -> None:
-        if self.acquired:
-            try:
-                # A lock may have been manually removed and recreated while
-                # we were running; never release another process's lock.
-                if self._read_existing().get("token") == self.token:
-                    self.path.unlink(missing_ok=True)
-            finally:
-                self.acquired = False
+        try:
+            if self.acquired:
+                try:
+                    if self._read_existing().get("token") == self.token:
+                        self.path.unlink(missing_ok=True)
+                finally:
+                    self.acquired = False
+        finally:
+            if self.guard_fd is not None:
+                fd, self.guard_fd = self.guard_fd, None
+                os.close(fd)  # releases OS lock; never unlink the guard file
+            atexit.unregister(self.release)
 
 
 class AuditLog:
@@ -512,29 +629,36 @@ class AuditLog:
         record = {"ts": int(time.time()), **self.context, "event": event, **fields}
         line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         # New audit files contain payment metadata and must not be world-readable.
+        new_file = not self.path.exists()
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if new_file:
+            fsync_directory(self.path.parent)
 
     def records_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
-        if not self.path.is_file():
-            return []
         records: list[dict[str, Any]] = []
-        with self.path.open("r", encoding="utf-8") as handle:
+        try:
+            handle = self.path.open("r", encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        with handle:
             for line_no, line in enumerate(handle, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    item = json.loads(line)
-                except json.JSONDecodeError as exc:
+                    item = json.loads(line, object_pairs_hook=unique_json_object)
+                except ValueError as exc:
                     raise RuntimeError(
                         f"Malformed audit log line {line_no} in {self.path}: {exc}. "
                         "Refusing resume because ignoring state corruption could duplicate a payout."
                     ) from exc
-                if isinstance(item, dict) and item.get("batch_id") == batch_id:
+                if not isinstance(item, dict) or not isinstance(item.get("event"), str):
+                    raise RuntimeError(f"Invalid audit record at line {line_no} in {self.path}; refusing resume")
+                if item.get("batch_id") == batch_id:
                     records.append(item)
         return records
 
@@ -545,8 +669,8 @@ class AuditLog:
 
 @dataclass
 class RPCNode:
-    url: str
-    w3: Web3
+    url: str = field(repr=False)
+    w3: Web3 = field(repr=False)
     failures: int = 0
     cooldown_until: float = 0.0
     chain_id: Optional[int] = None
@@ -568,26 +692,28 @@ class RPCPool:
     def validate_nodes(self) -> int:
         valid: list[RPCNode] = []
         detected_ids: set[int] = set()
+        genesis_hashes: set[str] = set()
         for node in self.nodes:
             try:
-                if not node.w3.is_connected():
-                    raise ConnectionError("is_connected() returned false")
                 chain_id = int(node.w3.eth.chain_id)
+                if chain_id <= 0:
+                    raise ValueError("Invalid RPC chain ID")
                 node.chain_id = chain_id
                 if self.cfg.chain_id_override and chain_id != self.cfg.chain_id_override:
                     raise RuntimeError(
                         f"wrong chain ID {chain_id}; expected {self.cfg.chain_id_override}"
                     )
+                genesis_hashes.add(normalize_tx_hash(node.w3.eth.get_block(0)["hash"]))
                 detected_ids.add(chain_id)
                 valid.append(node)
                 log.info("Validated RPC %s chain_id=%s", redact_url(node.url), chain_id)
             except Exception as exc:
-                log.warning("Ignoring RPC %s: %s", redact_url(node.url), exc)
+                log.warning("Ignoring RPC %s: %s", redact_url(node.url), safe_error(exc))
 
         if not valid:
             raise RuntimeError("No valid RPC nodes available")
-        if len(detected_ids) != 1:
-            raise RuntimeError(f"RPC_URLS point to different chains: {sorted(detected_ids)}")
+        if len(detected_ids) != 1 or len(genesis_hashes) != 1:
+            raise RuntimeError(f"RPC_URLS point to different chains or genesis blocks: {sorted(detected_ids)}")
 
         self.nodes = valid
         self.expected_chain_id = self.cfg.chain_id_override or next(iter(detected_ids))
@@ -602,13 +728,14 @@ class RPCPool:
             earliest = min(n.cooldown_until for n in self.nodes)
             delay = max(0.0, earliest - now)
             if delay:
-                time.sleep(delay)
+                sleep_interruptibly(delay)
             if STOP_REQUESTED:
                 raise StopRequested("Stop requested")
             candidates = [n for n in self.nodes if n.cooldown_until <= time.monotonic()]
             if not candidates:
                 candidates = [min(self.nodes, key=lambda n: n.cooldown_until)]
-        candidates.sort(key=lambda n: (n.failures, n.cooldown_until))
+        # Rotate across available nodes, including recovered nodes, so a
+        # healthy but lagging endpoint cannot monopolize receipt polling.
         node = candidates[self.cursor % len(candidates)]
         self.cursor += 1
         return node
@@ -637,12 +764,12 @@ class RPCPool:
                 node.cooldown_until = time.monotonic() + self.cfg.rpc_cooldown_seconds
                 log.warning(
                     "RPC call failed name=%s rpc=%s attempt=%s/%s error=%s",
-                    name, redact_url(node.url), attempt, attempts, exc,
+                    name, redact_url(node.url), attempt, attempts, safe_error(exc),
                 )
                 if attempt < attempts:
-                    time.sleep(min(0.35 * (2 ** (attempt - 1)) + random.random() * 0.25, 5.0))
+                    sleep_interruptibly(min(0.35 * (2 ** min(attempt - 1, 5)) + random.random() * 0.25, 5.0))
         assert last_exc is not None
-        raise RuntimeError(f"RPC call failed after {attempts} attempts: {name}: {last_exc}") from last_exc
+        raise RuntimeError(f"RPC call failed after {attempts} attempts: {name}: {safe_error(last_exc)}") from last_exc
 
     def send_raw(self, raw_tx: bytes) -> str:
         result = self.call(
@@ -650,16 +777,26 @@ class RPCPool:
             lambda w3: w3.eth.send_raw_transaction(raw_tx),
             retries=1,
         )
-        return result.hex()
+        return normalize_tx_hash(result)
 
 
 # -----------------------------------------------------------------------------
 # Recipients, fees, gas and preflight
 # -----------------------------------------------------------------------------
 
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON field: {key!r}")
+        result[key] = value
+    return result
+
+
 def load_recipients(cfg: Config) -> list[Recipient]:
     try:
-        raw = json.loads(cfg.recipients_file.read_text(encoding="utf-8-sig"))
+        raw = json.loads(cfg.recipients_file.read_text(encoding="utf-8-sig"),
+                         parse_float=Decimal, object_pairs_hook=unique_json_object)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Invalid JSON in {cfg.recipients_file} at line {exc.lineno}, column {exc.colno}: {exc.msg}"
@@ -708,6 +845,11 @@ def load_recipients(cfg: Config) -> list[Recipient]:
     return recipients
 
 
+def ceil_scaled_int(value: int, multiplier: Decimal) -> int:
+    numerator, denominator = multiplier.as_integer_ratio()
+    return (value * numerator + denominator - 1) // denominator
+
+
 def get_fee_params(rpc: RPCPool, cfg: Config) -> FeeParams:
     def fetch(w3: Web3) -> FeeParams:
         block = w3.eth.get_block("latest")
@@ -724,8 +866,7 @@ def get_fee_params(rpc: RPCPool, cfg: Config) -> FeeParams:
         tip_cap = gwei_to_wei(cfg.max_priority_fee_gwei)
         tip = min(tip, tip_cap)
 
-        multiplied = (Decimal(base_fee) * cfg.base_fee_multiplier).to_integral_value(rounding=ROUND_CEILING)
-        max_fee = int(multiplied) + tip
+        max_fee = ceil_scaled_int(base_fee, cfg.base_fee_multiplier) + tip
         fee_cap = gwei_to_wei(cfg.max_fee_cap_gwei)
         if max_fee > fee_cap:
             raise RuntimeError(
@@ -746,7 +887,7 @@ def estimate_gas(rpc: RPCPool, cfg: Config, treasury: str, recipient: Recipient)
             "value": recipient.value_wei,
         })),
     )
-    buffered = int((Decimal(estimated) * cfg.gas_buffer).to_integral_value(rounding=ROUND_CEILING))
+    buffered = ceil_scaled_int(estimated, cfg.gas_buffer)
     return max(buffered, cfg.min_gas_limit)
 
 
@@ -796,6 +937,20 @@ def make_batch_id(chain_id: int, treasury: str, recipients: Sequence[Recipient])
     return hashlib.sha256(canonical).hexdigest()
 
 
+def receipt_status(receipt: Any, tx_hash: str) -> int:
+    if normalize_tx_hash(receipt["transactionHash"]) != normalize_tx_hash(tx_hash):
+        raise RuntimeError("RPC receipt transaction hash mismatch")
+    status = int(receipt["status"])
+    if status not in (0, 1):
+        raise RuntimeError("Invalid RPC receipt status")
+    return status
+
+
+def receipt_canonical_on_node(w3: Web3, receipt: Any) -> bool:
+    block = w3.eth.get_block(int(receipt["blockNumber"]))
+    return normalize_tx_hash(block["hash"]) == normalize_tx_hash(receipt["blockHash"])
+
+
 def _query_tx_state_across_nodes(
     rpc: RPCPool,
     treasury: str,
@@ -821,6 +976,8 @@ def _query_tx_state_across_nodes(
     latest_nonces: list[int] = []
 
     for node in rpc.nodes:
+        if STOP_REQUESTED:
+            raise StopRequested("Stop requested")
         try:
             try:
                 receipt = node.w3.eth.get_transaction_receipt(tx_hash)
@@ -829,28 +986,34 @@ def _query_tx_state_across_nodes(
 
             if receipt is not None:
                 known = True
-                if int(receipt.get("status", 0)) == 1:
-                    successful_receipt = receipt
-                else:
-                    reverted_receipt = receipt
+                status = receipt_status(receipt, tx_hash)
+                if receipt_canonical_on_node(node.w3, receipt):
+                    if status == 1:
+                        successful_receipt = receipt
+                    else:
+                        reverted_receipt = receipt
 
             try:
-                node.w3.eth.get_transaction(tx_hash)
-                known = True
+                transaction = node.w3.eth.get_transaction(tx_hash)
+                if transaction is not None:
+                    if normalize_tx_hash(transaction["hash"]) != normalize_tx_hash(tx_hash):
+                        raise RuntimeError("RPC transaction hash mismatch")
+                    known = True
             except TransactionNotFound:
                 pass
 
-            pending_nonces.append(int(node.w3.eth.get_transaction_count(treasury, "pending")))
-            latest_nonces.append(int(node.w3.eth.get_transaction_count(treasury, "latest")))
+            pending = int(node.w3.eth.get_transaction_count(treasury, "pending"))
+            latest = int(node.w3.eth.get_transaction_count(treasury, "latest"))
+            if pending < latest or latest < 0:
+                raise RuntimeError("Invalid RPC nonce observations")
+            pending_nonces.append(pending)
+            latest_nonces.append(latest)
             responsive += 1
         except Exception as exc:
             log.warning(
                 "Resume reconciliation RPC failed rpc=%s tx=%s error=%s",
-                redact_url(node.url), tx_hash, exc,
+                redact_url(node.url), tx_hash, safe_error(exc),
             )
-
-    if responsive == 0:
-        return "ambiguous", None
 
     # Absence is much harder to prove than presence. A failed/unreachable RPC
     # must never help us conclude that a transaction was never broadcast.
@@ -912,71 +1075,57 @@ def recover_batch_progress(
     if not records:
         return RecoveryState(set(), {})
 
-    valid_indices = {r.idx for r in recipients}
+    by_idx = {r.idx: r for r in recipients}
     confirmed: set[int] = set()
-    unresolved: dict[int, dict[str, Any]] = {}
-    seen_evidence: dict[int, tuple[str, int]] = {}
+    evidence: dict[int, tuple[int, set[str]]] = {}
+    confirmed_hashes: dict[int, set[str]] = {}
+    nonce_owners: dict[int, int] = {}
     safe_retry_nonces: dict[int, int] = {}
     inconsistent_evidence: set[int] = set()
-
-    broadcastish_events = {
-        "prepared",
-        "sent",
-        "already_known",
-        "found_after_send_error",
-        "send_unknown",
-        "nonce_consumed",
-        "nonce_conflict_unresolved",
+    evidence_events = {
+        "prepared", "sent", "already_known", "found_after_send_error",
+        "send_unknown", "nonce_consumed", "nonce_conflict_unresolved", "receipt",
+        "resume_reconciled_confirmed", "resume_reconciled_not_broadcast",
     }
 
     for record in records:
+        event = record.get("event")
+        if event == "dry_run" or record.get("dry_run") is True:
+            continue
+        if event not in evidence_events:
+            continue
         idx = record.get("idx")
-        if type(idx) is not int or idx not in valid_indices:
+        if type(idx) is not int or idx not in by_idx:
+            raise RuntimeError("Invalid recipient index in transaction audit evidence")
+        nonce = record.get("nonce")
+        try:
+            tx_hash = normalize_tx_hash(record.get("tx_hash"))
+        except ValueError:
+            inconsistent_evidence.add(idx)
             continue
-
-        event = str(record.get("event", ""))
-        status = str(record.get("status", ""))
-
-        # Dry-run events must not create OR erase real-send evidence. Erasing
-        # earlier unresolved state here could cause a duplicate payment after
-        # a later dry-run executed with RESUME=false.
-        if event == "dry_run" or bool(record.get("dry_run", False)):
+        if type(nonce) is not int or nonce < 0:
+            inconsistent_evidence.add(idx)
             continue
-
-        if event in broadcastish_events or event in {"receipt", "resume_reconciled_confirmed"}:
-            tx_hash = record.get("tx_hash")
-            nonce = record.get("nonce")
-            if (
-                not isinstance(tx_hash, str) or not tx_hash
-                or type(nonce) is not int or nonce < 0
-            ):
-                inconsistent_evidence.add(idx)
-            else:
-                earlier = seen_evidence.setdefault(idx, (tx_hash.lower(), nonce))
-                if earlier[1] != nonce:
-                    # Different nonces can both pay the recipient, even if
-                    # hashes in a corrupted audit log happen to match.
-                    # Never silently forget one after RESUME=false.
-                    inconsistent_evidence.add(idx)
-
-        if (event == "receipt" and status == "confirmed") or event == "resume_reconciled_confirmed":
+        recipient = by_idx[idx]
+        if ("to" in record and (not isinstance(record["to"], str)
+                               or record["to"].lower() != recipient.to.lower())) or (
+            "value_wei" in record and (type(record["value_wei"]) is not int
+                                       or record["value_wei"] != recipient.value_wei)
+        ):
+            inconsistent_evidence.add(idx)
+            continue
+        owner = nonce_owners.setdefault(nonce, idx)
+        if owner != idx:
+            inconsistent_evidence.update((owner, idx))
+        original_nonce, hashes = evidence.setdefault(idx, (nonce, set()))
+        if original_nonce != nonce:
+            inconsistent_evidence.add(idx)
+        hashes.add(tx_hash)
+        if (event == "receipt" and record.get("status") == "confirmed") or event == "resume_reconciled_confirmed":
+            confirmed_hashes.setdefault(idx, set()).add(tx_hash)
             confirmed.add(idx)
-            unresolved.pop(idx, None)
-            continue
 
-        # A completed payout does not make later send evidence disappear.
-        # For example, RESUME=false can start another payout with a different
-        # nonce; this must remain visible to the conflict check above.
-        if idx in confirmed:
-            continue
-
-        if event in broadcastish_events or event == "receipt":
-            # Keep the most recent useful transaction evidence for this idx.
-            previous = unresolved.get(idx, {})
-            merged = dict(previous)
-            merged.update(record)
-            unresolved[idx] = merged
-
+    inconsistent_evidence.update(idx for idx, hashes in confirmed_hashes.items() if len(hashes) > 1)
     if inconsistent_evidence:
         raise RuntimeError(
             "Conflicting or incomplete audit transaction evidence for recipients "
@@ -985,63 +1134,39 @@ def recover_batch_progress(
         )
 
     ambiguous: list[str] = []
-
-    for idx, record in sorted(unresolved.items()):
-        tx_hash_raw = record.get("tx_hash")
-        nonce_raw = record.get("nonce")
-        if not tx_hash_raw or not isinstance(nonce_raw, int):
-            ambiguous.append(f"#{idx}:missing_tx_evidence")
+    for idx, (nonce, hashes) in sorted(evidence.items()):
+        if idx in confirmed:
+            continue  # Existing durable confirmation remains authoritative.
+        # Fee refreshes can create multiple hashes for one nonce. A previously
+        # prepared hash may be the one that eventually mined; never forget it.
+        states = [(tx_hash, *_query_tx_state_across_nodes(rpc, treasury, nonce, tx_hash))
+                  for tx_hash in sorted(hashes)]
+        mined = [(h, state) for h, state, _ in states if state in {"confirmed", "reverted"}]
+        if len(mined) > 1:
+            ambiguous.append(f"#{idx}:conflicting_mined_hashes")
             continue
-
-        tx_hash = str(tx_hash_raw)
-        nonce = int(nonce_raw)
-        state, receipt = _query_tx_state_across_nodes(
-            rpc, treasury, nonce, tx_hash
-        )
-
-        if state == "confirmed":
-            # Preserve the same confirmation policy used during the normal send
-            # path. A crash/restart must not silently weaken CONFIRMATIONS.
+        candidates = [h for h, state, _ in states if state == "confirmed"]
+        if not candidates and not mined:
+            known = [h for h, state, _ in states if state == "known"]
+            if len(known) == 1:
+                candidates = known
+        if candidates:
+            tx_hash = candidates[0]
             confirmation_status = wait_for_receipt(rpc, cfg, tx_hash)
             if confirmation_status == "confirmed":
                 confirmed.add(idx)
-                audit.write(
-                    "resume_reconciled_confirmed",
-                    idx=idx,
-                    nonce=nonce,
-                    tx_hash=tx_hash,
-                    block_number=int(receipt["blockNumber"]) if receipt is not None else None,
-                )
-                log.warning(
-                    "Recovered recipient #%s as confirmed from on-chain state tx=%s",
-                    idx, tx_hash,
-                )
+                audit.write("resume_reconciled_confirmed", idx=idx, nonce=nonce, tx_hash=tx_hash)
+                log.warning("Recovered recipient #%s as confirmed from on-chain state tx=%s", idx, tx_hash)
                 continue
-
-            ambiguous.append(
-                f"#{idx}:reconcile_{confirmation_status}:{tx_hash}"
-            )
+            ambiguous.append(f"#{idx}:reconcile_{confirmation_status}:{tx_hash}")
             continue
-
-        if state == "not_broadcast":
-            # Prepared-but-never-broadcast, or a failed send that is now proven
-            # absent while the nonce is still free. It is safe to retry.
-            audit.write(
-                "resume_reconciled_not_broadcast",
-                idx=idx,
-                nonce=nonce,
-                tx_hash=tx_hash,
-            )
-            # Retrying at a *new* nonce would risk paying twice if the
-            # original transaction later propagates. Pin the old nonce.
+        if all(state == "not_broadcast" for _, state, _ in states):
+            for tx_hash, _, _ in states:
+                audit.write("resume_reconciled_not_broadcast", idx=idx, nonce=nonce, tx_hash=tx_hash)
             safe_retry_nonces[idx] = nonce
-            log.warning(
-                "Recovered recipient #%s as safe-to-retry ONLY at original nonce=%s",
-                idx, nonce,
-            )
+            log.warning("Recovered recipient #%s as safe-to-retry ONLY at original nonce=%s", idx, nonce)
             continue
-
-        ambiguous.append(f"#{idx}:{state}:{tx_hash}")
+        ambiguous.append(f"#{idx}:" + ",".join(f"{state}:{h}" for h, state, _ in states))
 
     if ambiguous:
         raise RuntimeError(
@@ -1077,59 +1202,70 @@ def receipt_is_canonical(rpc: RPCPool, receipt: Any) -> bool:
 
 def wait_for_receipt(rpc: RPCPool, cfg: Config, tx_hash: str) -> str:
     deadline = time.monotonic() + cfg.receipt_timeout
-    while time.monotonic() < deadline:
-        if STOP_REQUESTED:
-            return "interrupted"
-        receipt = get_receipt_once(rpc, tx_hash)
-        if receipt is not None:
-            status = int(receipt.get("status", 0))
-            if status != 1:
-                return "reverted"
-            block_number = int(receipt["blockNumber"])
-            if not receipt_is_canonical(rpc, receipt):
-                return "reorged"
-            if cfg.confirmations <= 1:
-                return "confirmed"
+    confirm_deadline: Optional[float] = None
+    inclusion: Optional[tuple[int, str]] = None
 
-            confirm_deadline = time.monotonic() + cfg.confirmation_timeout
-            while time.monotonic() < confirm_deadline:
-                if STOP_REQUESTED:
-                    return "interrupted"
-                latest = int(rpc.call("latest_block", lambda w3: w3.eth.block_number))
-                if latest - block_number + 1 >= cfg.confirmations:
-                    # Re-read the receipt to catch a rare reorg/removal.
-                    final_receipt = get_receipt_once(rpc, tx_hash)
-                    if final_receipt is None:
-                        return "reorged"
-                    if int(final_receipt.get("status", 0)) != 1:
-                        return "reverted"
-                    # A reorg can reinclude the transaction in a different,
-                    # newer block; its new inclusion must also mature.
-                    if (
-                        int(final_receipt["blockNumber"]) != block_number
-                        or final_receipt.get("blockHash") != receipt.get("blockHash")
-                        or not receipt_is_canonical(rpc, final_receipt)
-                    ):
-                        return "reorged"
+    def observe(w3: Web3) -> tuple[Optional[Any], bool, int]:
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+        except TransactionNotFound:
+            return None, False, 0
+        if receipt is None:
+            return None, False, 0
+        receipt_status(receipt, tx_hash)
+        if not receipt_canonical_on_node(w3, receipt):
+            return receipt, False, 0
+        block_number = int(receipt["blockNumber"])
+        if cfg.confirmations <= 1:
+            return receipt, True, 1
+        depth = int(w3.eth.block_number) - block_number + 1
+        if depth >= cfg.confirmations:
+            # Check again after reading the head so a changed inclusion cannot
+            # borrow confirmation depth from an older block.
+            if not receipt_canonical_on_node(w3, receipt):
+                return receipt, False, 0
+        return receipt, True, max(0, depth)
+
+    try:
+        while time.monotonic() < (confirm_deadline if confirm_deadline is not None else deadline):
+            receipt, canonical, depth = rpc.call("observe_receipt", observe)
+            if receipt is not None:
+                if not canonical:
+                    return "reorged"
+                current = (int(receipt["blockNumber"]), normalize_tx_hash(receipt["blockHash"]))
+                if inclusion is not None and inclusion != current:
+                    return "reorged"
+                if receipt_status(receipt, tx_hash) == 0:
+                    return "reverted"
+                if depth >= cfg.confirmations:
                     return "confirmed"
-                time.sleep(cfg.receipt_poll_interval)
-            return "confirmation_timeout"
-        time.sleep(cfg.receipt_poll_interval)
-    return "receipt_timeout"
+                if confirm_deadline is None:
+                    inclusion = current
+                    confirm_deadline = time.monotonic() + cfg.confirmation_timeout
+            # A lagging RPC may temporarily not know an observed receipt.
+            # Do not treat that alone as a reorg or reset the timeout.
+            remaining = (confirm_deadline if confirm_deadline is not None else deadline) - time.monotonic()
+            sleep_interruptibly(max(0.0, min(cfg.receipt_poll_interval, remaining)))
+    except StopRequested:
+        return "interrupted"
+    return "confirmation_timeout" if confirm_deadline is not None else "receipt_timeout"
 
 
 def tx_is_known(rpc: RPCPool, tx_hash: str) -> bool:
     """Return True if any validated RPC can prove the transaction is known."""
     for node in rpc.nodes:
+        if STOP_REQUESTED:
+            raise StopRequested("Stop requested")
         try:
-            node.w3.eth.get_transaction(tx_hash)
-            return True
+            transaction = node.w3.eth.get_transaction(tx_hash)
+            if transaction is not None and normalize_tx_hash(transaction["hash"]) == normalize_tx_hash(tx_hash):
+                return True
         except TransactionNotFound:
             continue
         except Exception as exc:
             log.warning(
                 "Transaction lookup failed rpc=%s tx=%s error=%s",
-                redact_url(node.url), tx_hash, exc,
+                redact_url(node.url), tx_hash, safe_error(exc),
             )
     return False
 
@@ -1147,6 +1283,8 @@ def reconcile_nonce(rpc: RPCPool, treasury: str, nonce: int, tx_hash: str) -> bo
             "reconcile_latest_nonce",
             lambda w3: w3.eth.get_transaction_count(treasury, "latest"),
         ))
+    except StopRequested:
+        raise
     except Exception:
         return False
     return pending_nonce > nonce or latest_nonce > nonce
@@ -1159,10 +1297,12 @@ def observed_pending_nonce(rpc: RPCPool, treasury: str) -> int:
     """
     pending: list[int] = []
     for node in rpc.nodes:
+        if STOP_REQUESTED:
+            raise StopRequested("Stop requested")
         try:
             latest = int(node.w3.eth.get_transaction_count(treasury, "latest"))
             candidate = int(node.w3.eth.get_transaction_count(treasury, "pending"))
-            if candidate < latest:
+            if candidate < latest or latest < 0:
                 raise RuntimeError("pending nonce is below mined nonce")
             pending.append(candidate)
         except Exception as exc:
@@ -1202,7 +1342,7 @@ def build_signed_transaction(
     if raw is None:
         raw = getattr(signed, "rawTransaction")
     raw_bytes = bytes(raw)
-    tx_hash = Web3.keccak(raw_bytes).hex()
+    tx_hash = normalize_tx_hash(Web3.keccak(raw_bytes))
     return tx, raw_bytes, tx_hash
 
 
@@ -1224,7 +1364,7 @@ def _finish_send(
     except Exception as exc:
         # The prepared/sent evidence has already been durably written. A
         # receipt RPC failure does not imply that sending failed.
-        log.error("[%s] receipt lookup failed for %s: %s", recipient.idx, tx_hash, exc)
+        log.error("[%s] receipt lookup failed for %s: %s", recipient.idx, tx_hash, safe_error(exc))
         status = "receipt_lookup_error"
     audit.write("receipt", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash, status=status)
     if status in {"receipt_timeout", "confirmation_timeout"}:
@@ -1282,6 +1422,8 @@ def send_one(
             return SendResult(False, False, tx_hash, "interrupted_before_send")
         try:
             returned_hash = rpc.send_raw(raw_tx)
+        except StopRequested:
+            raise
         except Exception as exc:
             last_error = exc
             if is_already_known(exc):
@@ -1289,6 +1431,9 @@ def send_one(
                 return _finish_send(rpc, cfg, audit, recipient, nonce, tx_hash, "already_known")
 
             if is_nonce_too_low(exc) or is_replacement_underpriced(exc):
+                if tx_is_known(rpc, tx_hash):
+                    audit.write("found_after_send_error", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash)
+                    return _finish_send(rpc, cfg, audit, recipient, nonce, tx_hash, "found_after_send_error")
                 consumed = reconcile_nonce(rpc, treasury, nonce, tx_hash)
                 status = "nonce_consumed" if consumed else "nonce_conflict_unresolved"
                 audit.write(
@@ -1296,17 +1441,17 @@ def send_one(
                     idx=recipient.idx,
                     nonce=nonce,
                     tx_hash=tx_hash,
-                    error=str(exc),
+                    error=safe_error(exc),
                 )
                 log.error(
                     "[%s] nonce conflict nonce=%s consumed=%s tx=%s error=%s",
-                    recipient.idx, nonce, consumed, tx_hash, exc,
+                    recipient.idx, nonce, consumed, tx_hash, safe_error(exc),
                 )
                 return SendResult(False, consumed, tx_hash, status)
 
             log.warning(
                 "[%s] send attempt %s/%s failed: %s",
-                recipient.idx, attempt, cfg.retry_limit, exc,
+                recipient.idx, attempt, cfg.retry_limit, safe_error(exc),
             )
             if attempt < cfg.retry_limit:
                 if tx_is_known(rpc, tx_hash):
@@ -1314,7 +1459,7 @@ def send_one(
                     return _finish_send(
                         rpc, cfg, audit, recipient, nonce, tx_hash, "found_after_send_error"
                     )
-                time.sleep(min(0.5 * (2 ** (attempt - 1)) + random.random() * 0.5, 8.0))
+                sleep_interruptibly(min(0.5 * (2 ** min(attempt - 1, 5)) + random.random() * 0.5, 8.0))
             continue
 
         if returned_hash.lower() != tx_hash.lower():
@@ -1334,15 +1479,17 @@ def send_one(
         audit.write("sent", idx=recipient.idx, to=recipient.to, nonce=nonce, tx_hash=tx_hash)
         return _finish_send(rpc, cfg, audit, recipient, nonce, tx_hash, "broadcast")
 
-    known = tx_is_known(rpc, tx_hash)
-    consumed = known or reconcile_nonce(rpc, treasury, nonce, tx_hash)
+    if tx_is_known(rpc, tx_hash):
+        audit.write("found_after_send_error", idx=recipient.idx, nonce=nonce, tx_hash=tx_hash)
+        return _finish_send(rpc, cfg, audit, recipient, nonce, tx_hash, "found_after_send_error")
+    consumed = reconcile_nonce(rpc, treasury, nonce, tx_hash)
     audit.write(
         "send_unknown",
         idx=recipient.idx,
         nonce=nonce,
         tx_hash=tx_hash,
         nonce_consumed=consumed,
-        error=str(last_error) if last_error else None,
+        error=safe_error(last_error) if last_error else None,
     )
     log.error(
         "[%s] send result unknown tx=%s nonce=%s consumed=%s; stopping for manual review",
@@ -1359,6 +1506,13 @@ def run() -> int:
     cfg = Config.from_env()
     lock = ProcessLock(cfg.lock_file, cfg.stale_lock_seconds)
     lock.acquire()
+    try:
+        return run_locked(cfg)
+    finally:
+        lock.release()
+
+
+def run_locked(cfg: Config) -> int:
     audit = AuditLog(cfg.state_file)
 
     signal.signal(signal.SIGINT, request_stop)
@@ -1399,6 +1553,11 @@ def run() -> int:
     fees, pending_gas_limits = preflight(rpc, cfg, treasury, pending_recipients)
     gas_by_idx = {r.idx: gas for r, gas in zip(pending_recipients, pending_gas_limits)}
     nonce = observed_pending_nonce(rpc, treasury)
+    # Detect an inconsistent recovery plan before sending even the first payout.
+    for offset, recipient in enumerate(pending_recipients):
+        pinned = recovery.safe_retry_nonces.get(recipient.idx)
+        if pinned is not None and pinned != nonce + offset:
+            raise RuntimeError(f"Unsafe retry plan for recipient #{recipient.idx}: original nonce={pinned}, planned={nonce + offset}")
 
     audit.write(
         "batch_start",
@@ -1427,6 +1586,8 @@ def run() -> int:
             )
         if not cfg.dry_run:
             network_nonce = observed_pending_nonce(rpc, treasury)
+            if network_nonce < nonce and cfg.wait_receipts:
+                raise RuntimeError(f"Pending nonce fell behind before recipient #{recipient.idx}: expected={nonce}, observed={network_nonce}; stopping")
             if network_nonce > nonce:
                 raise RuntimeError(
                     f"Pending nonce advanced unexpectedly before recipient #{recipient.idx}: "
@@ -1476,7 +1637,7 @@ def run() -> int:
     )
     if failed == 0 and not STOP_REQUESTED:
         audit.write(
-            "batch_complete",
+            "batch_complete" if cfg.wait_receipts or cfg.dry_run else "batch_broadcast_complete",
             success=success,
             total_recipients=len(recipients),
             dry_run=cfg.dry_run,
@@ -1495,5 +1656,5 @@ if __name__ == "__main__":
         log.warning("Interrupted")
         raise SystemExit(130)
     except Exception as exc:
-        log.exception("Fatal error: %s", exc)
+        log.error("Fatal error: %s", safe_error(exc))
         raise SystemExit(1)
